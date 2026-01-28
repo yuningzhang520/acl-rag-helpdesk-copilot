@@ -1,0 +1,100 @@
+name: IT Helpdesk Request
+description: Submit an internal IT helpdesk request (VPN, MFA, access, onboarding, etc.)
+title: "[IT] "
+labels: ["intake"]
+body:
+  - type: dropdown
+    id: request_type
+    attributes:
+      label: Request Type
+      description: Select the type of IT request
+      options:
+        - VPN
+        - MFA
+        - Access
+        - Onboarding
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: urgency
+    attributes:
+      label: Urgency
+      description: How urgent is this request?
+      options:
+        - Low
+        - Medium
+        - High
+        - Critical
+    validations:
+      required: true
+
+  - type: dropdown
+    id: user_role
+    attributes:
+      label: User Role
+      description: Role of the user making the request (self-declared; enforcement can use directory mapping)
+      options:
+        - Employee
+        - Engineer
+        - IT Admin
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      description: Where are you seeing the issue?
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - iOS
+        - Android
+        - Web
+        - Other
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: sensitivity
+    attributes:
+      label: Sensitivity / Access
+      description: Helps route and apply approval gates.
+      options:
+        - label: This request involves access/permissions or sensitive data.
+    validations:
+      required: false
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Description
+      description: Provide details (context, error messages, steps tried).
+      placeholder: |
+        - What do you need help with?
+        - What have you already tried?
+        - Any error messages?
+        - Screenshots/links (optional)
+    validations:
+      required: true
+
+  - type: input
+    id: incident_timestamp
+    attributes:
+      label: Incident/Request Timestamp
+      description: When did this occur? (YYYY-MM-DD HH:MM). Leave blank if unknown.
+      placeholder: "2026-01-27 14:30"
+    validations:
+      required: false
+
+  - type: input
+    id: target_resolution_date
+    attributes:
+      label: Target Resolution Date (Optional)
+      description: When does this need to be resolved by? (YYYY-MM-DD)
+      placeholder: "2026-01-30"
+    validations:
+      required: false
