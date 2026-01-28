@@ -77,3 +77,4 @@ When you add a runnable entrypoint, document:
 - `demo/`: demo scripts, sample tickets, and example UI/CLI showcase.
 - `src/`: application source code (copilot core, connectors, retrieval, orchestration).
 
+p.s. test
