@@ -36,7 +36,8 @@ ROLE_TIER_MAP = {
 CATEGORY_KEYWORDS = {
     "VPN": ["vpn"],
     "MFA": ["mfa", "2fa", "multi-factor"],
-    "Access": ["access", "permission", "grant", "iam", "role", "group"],
+    # Access: include common enterprise phrasing to reduce cat:Other
+    "Access": ["access", "permission", "grant", "iam", "role", "group", "shared drive", "drive", "folder", "sharepoint", "onedrive", "google drive"],
     "Onboarding": ["onboarding", "new hire"],
 }
 
@@ -48,30 +49,32 @@ PRIORITY_KEYWORDS = {
 }
 
 
-def load_directory(csv_path: str) -> Dict[str, Dict]:
-    """Load user directory and return user_id -> user_info mapping."""
+def load_directory(csv_path: str) -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
+    """
+    Load user directory. Returns (by_user_id, by_github_username).
+    by_github_username[login] = {role, user_id} for approval validation.
+    """
     directory = {}
+    by_github = {}
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             user_id = row["user_id"]
             role = row["role"]
-            # Handle restricted_grant column if present (for exceptions)
+            github_username = (row.get("github_username") or "").strip()
             restricted_grant = row.get("restricted_grant", "false").lower() == "true"
-            
-            # Determine allowed tiers based on role
             allowed_tiers = ROLE_TIER_MAP.get(role, []).copy()
-            
-            # If user has explicit restricted grant, add restricted tier
             if restricted_grant and "restricted" not in allowed_tiers:
                 allowed_tiers.append("restricted")
-            
             directory[user_id] = {
                 "role": role,
                 "display_name": row.get("display_name", ""),
                 "allowed_tiers": allowed_tiers,
+                "github_username": github_username,
             }
-    return directory
+            if github_username:
+                by_github[github_username.lower()] = {"role": role, "user_id": user_id}
+    return directory, by_github
 
 
 def resolve_user(user_id: str, directory: Dict, role_override: Optional[str] = None) -> Dict:
@@ -272,6 +275,93 @@ def triage_issue(issue_text: str) -> Dict[str, str]:
     return {"category": category, "priority": priority}
 
 
+def build_proposed_actions_struct(
+    triage: Dict[str, str],
+    proposed_actions: List[str],
+    mode: str,
+) -> Dict:
+    """
+    risk_level: L2 only when category == "Access"; High/Critical alone do not trigger L2.
+    Else L1 if writeback planned; else needs_approval=false.
+    L1 -> approval_role Engineer (or IT Admin). L2 -> approval_role IT Admin.
+    Employee approvals are invalid (enforced at validation time).
+    """
+    category = triage.get("category", "Other")
+    priority = triage.get("priority", "Low")
+    writeback_planned = mode == "github" and bool(proposed_actions)
+
+    # L2 only when category == "Access"; High/Critical alone do not trigger L2
+    if category == "Access":
+        risk_level = "L2"
+        approval_role = "IT Admin"
+        needs_approval = True
+    elif writeback_planned:
+        risk_level = "L1"
+        approval_role = "Engineer"
+        needs_approval = True
+    else:
+        risk_level = "L1"  # placeholder when no approval needed
+        approval_role = "Engineer"
+        needs_approval = False
+
+    # Enterprise label format: cat:<Category>, prio:<Priority>, status:pending-approval | status:approved
+    labels_to_add = []
+    if mode == "github":
+        labels_to_add = [f"cat:{category}", f"prio:{priority}", "status:pending-approval"]
+    assignees = []  # allowlisted; could be config-driven later
+    comment_summary = "Proposed: " + "; ".join(proposed_actions[:3]) if proposed_actions else "No actions"
+
+    return {
+        "risk_level": risk_level,
+        "needs_approval": needs_approval,
+        "approval_role": approval_role,
+        "labels_to_add": labels_to_add,
+        "assignees": assignees,
+        "comment_summary": comment_summary,
+    }
+
+
+def _parse_proposed_plan_struct_from_comment(body: str) -> Optional[Dict]:
+    """Extract proposed_actions_struct from a Proposed Plan comment body (```json ... ```)."""
+    if not body:
+        return None
+    match = re.search(r"```json\s*([\s\S]*?)```", body)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1).strip())
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _find_latest_proposed_plan_and_approve(
+    comments: List[Dict],
+) -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
+    """
+    Find the most recent comment containing 'Proposed Plan (PENDING APPROVAL)',
+    then the latest APPROVE comment posted *after* it.
+    comments are assumed in ascending order (oldest first).
+    Returns (plan_comment, parsed_struct, approve_comment_after_plan).
+    """
+    plan_comment = None
+    plan_index = -1
+    for i in range(len(comments) - 1, -1, -1):
+        if "Proposed Plan (PENDING APPROVAL)" in (comments[i].get("body") or ""):
+            plan_comment = comments[i]
+            plan_index = i
+            break
+    if plan_comment is None:
+        return None, None, None
+    struct = _parse_proposed_plan_struct_from_comment(plan_comment.get("body") or "")
+    approve_comment = None
+    for i in range(len(comments) - 1, plan_index, -1):
+        body = (comments[i].get("body") or "")
+        if re.match(r"^\s*APPROVE\s*$", body, flags=re.I):
+            approve_comment = comments[i]
+            break
+    return plan_comment, struct, approve_comment
+
+
 def generate_answer_mock(context_sections: List[Dict], issue_text: str) -> Dict:
     """Generate mock answer with citations (public-safe) based on retrieved sections."""
     if not context_sections:
@@ -457,10 +547,26 @@ def main():
     parser.add_argument("--user_id", required=True, help="User ID from directory.csv")
     parser.add_argument("--issue", required=True, help="Issue/question text")
     parser.add_argument("--top_k", type=int, default=3, help="Number of sections to retrieve (default: 3)")
-    parser.add_argument("--mode", choices=["mock", "openai"], default="mock", help="Answer generation mode (default: mock)")
+    parser.add_argument("--mode", choices=["mock", "openai", "github"], default="mock", help="Answer generation mode (default: mock)")
     parser.add_argument("--role_override", help="Override role if user_id not found (Employee/Engineer/IT Admin)")
-    
+    parser.add_argument("--repo", help="GitHub repo owner/name (required for --mode github)")
+    parser.add_argument("--issue_number", type=int, help="GitHub issue number (required for --mode github)")
+    parser.add_argument("--github_stage", choices=["propose", "execute"], default="propose", help="GitHub mode: propose = post plan only; execute = check approval and run allowlisted actions (default: propose)")
     args = parser.parse_args()
+    import time as _time
+    _start_audit = _time.perf_counter()
+
+    if args.mode == "github" and (not args.repo or args.issue_number is None):
+        error_output = {
+            "answer": "Error: --repo and --issue_number are required when --mode github",
+            "citations": [],
+            "triage": {"category": "Other", "priority": "Low"},
+            "retrieval_confidence": 0.0,
+            "proposed_actions": [],
+            "debug": {"error": "github_requires_repo_and_issue"},
+        }
+        print(json.dumps(error_output, indent=2))
+        sys.exit(1)
     
     # Load directory
     repo_root = Path(__file__).parent.parent
@@ -471,15 +577,15 @@ def main():
             "answer": f"Error: Directory file not found at {directory_path}",
             "citations": [],
             "triage": {"category": "Other", "priority": "Low"},
-            "confidence": 0.0,
+            "retrieval_confidence": 0.0,
             "proposed_actions": ["Check directory.csv path"],
             "debug": {"error": "directory_not_found"},
         }
         print(json.dumps(error_output, indent=2))
         sys.exit(1)
     
-    directory = load_directory(str(directory_path))
-    
+    directory, by_github_username = load_directory(str(directory_path))
+
     # Resolve user
     user_info = resolve_user(args.user_id, directory, args.role_override)
     if not user_info:
@@ -487,7 +593,7 @@ def main():
             "answer": f"Error: User ID '{args.user_id}' not found in directory",
             "citations": [],
             "triage": {"category": "Other", "priority": "Low"},
-            "confidence": 0.0,
+            "retrieval_confidence": 0.0,
             "proposed_actions": ["Provide valid user_id or use --role_override"],
             "debug": {"error": "user_not_found", "user_id": args.user_id},
         }
@@ -512,30 +618,210 @@ def main():
     
     # Triage
     triage_data = triage_issue(args.issue)
-    
-    # Build final output
+    proposed_actions_struct = build_proposed_actions_struct(
+        triage_data, answer_data["proposed_actions"], args.mode
+    )
+
+    # Build base output (triage_method=keyword, retrieval_confidence)
+    debug_retrieved = [
+        {"doc": s["doc_path"], "section": s["heading"], "tier": s["tier"], "score": s["score"]}
+        for s in retrieved
+    ]
     output = {
         "answer": answer_data["answer"],
         "citations": answer_data["citations"],
         "triage": triage_data,
-        "confidence": answer_data["confidence"],
+        "triage_method": "keyword",
+        "retrieval_confidence": answer_data["confidence"],
         "proposed_actions": answer_data["proposed_actions"],
+        "proposed_actions_struct": proposed_actions_struct,
         "debug": {
             "user_id": args.user_id,
             "role": role,
             "allowed_tiers": allowed_tiers,
-            "retrieved": [
-                {
-                    "doc": s["doc_path"],
-                    "section": s["heading"],
-                    "tier": s["tier"],
-                    "score": s["score"],
-                }
-                for s in retrieved
-            ],
+            "retrieved": debug_retrieved,
         },
     }
-    
+
+    # Audit log (every run)
+    repo_root = Path(__file__).parent.parent
+    audit_path = repo_root / "workflows" / "audit_log.jsonl"
+    audit_record = {
+        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "repo": str(args.repo) if (args.mode == "github" and args.repo) else "",
+        "issue_number": int(args.issue_number) if (args.mode == "github" and args.issue_number is not None) else 0,
+        "requester_user_id": str(args.user_id),
+        "requester_role": str(role),
+        "allowed_tiers": list(allowed_tiers),
+        "triage": {**triage_data, "method": "keyword"},
+        "retrieval_confidence": float(output["retrieval_confidence"]),
+        "retrieved": debug_retrieved,
+        "citations": output["citations"],
+        "proposed_actions_struct": proposed_actions_struct,
+        "approval_status": "n/a",
+        "approval_actor_login": "",
+        "approval_actor_role": "",
+        "executed_actions": [],
+        "execution_result": "n/a",
+        "latency_ms": 0,
+    }
+    if args.mode == "github":
+        from . import github_bot
+        from . import audit
+        # Audit: consistent string fields; executed_actions always a list
+        audit_record["approval_status"] = "n/a"
+        audit_record["approval_actor_login"] = ""
+        audit_record["approval_actor_role"] = ""
+        audit_record["executed_actions"] = []
+        audit_record["execution_result"] = "n/a"
+        try:
+            stage = getattr(args, "github_stage", "propose") or "propose"
+            if stage == "propose":
+                # Only post Proposed Plan and exit (no approval checks)
+                plan_body = (
+                    "## Proposed Plan (PENDING APPROVAL)\n\n"
+                    + answer_data["answer"]
+                    + "\n\n### Proposed actions (struct)\n```json\n"
+                    + json.dumps(proposed_actions_struct, indent=2)
+                    + "\n```"
+                )
+                github_bot.post_comment(args.repo, args.issue_number, plan_body)
+
+                labels = list(proposed_actions_struct.get("labels_to_add") or [])
+                if labels:
+                    github_bot.add_labels(args.repo, args.issue_number, labels, remove_prefixes=["status:"])
+
+                audit_record["approval_status"] = "n/a"
+                audit_record["execution_result"] = "propose_only"
+                audit_record["executed_actions"] = []
+            else:
+                # execute: do NOT post plan; only consider APPROVE comments after latest Proposed Plan
+                comments = github_bot.list_comments(args.repo, args.issue_number)
+                plan_comment, parsed_struct, approve_comment = _find_latest_proposed_plan_and_approve(comments)
+                # Enterprise-safe: only execute actions based on the last Proposed Plan.
+                # If plan exists but JSON struct is missing/unparseable, do not execute.
+                if plan_comment is not None and not parsed_struct:
+                    audit_record["approval_status"] = "rejected"
+                    audit_record["execution_result"] = "invalid_plan_format"
+                    audit_record["executed_actions"] = []
+                    latency_ms = round((_time.perf_counter() - _start_audit) * 1000)
+                    audit_record["latency_ms"] = latency_ms
+                    audit.append_jsonl(audit_record, path=audit_path, repo_root=repo_root)
+                    print(json.dumps(output, indent=2))
+                    return
+
+                struct_for_execute = parsed_struct if parsed_struct else proposed_actions_struct
+                approval_status = "pending"
+                approval_actor_login = ""
+                approval_actor_role = ""
+                executed_actions = []
+                execution_result = "skipped"
+                if approve_comment:
+                    approval_actor_login = (approve_comment.get("login") or "")
+                    login_lower = approval_actor_login.lower()
+                    approver_info = by_github_username.get(login_lower)
+                    if approver_info:
+                        approval_actor_role = approver_info.get("role") or ""
+                        if approval_actor_role == "Employee":
+                            approval_status = "rejected"
+                            execution_result = "rejected_employee_approval"
+                        elif struct_for_execute.get("needs_approval"):
+                            if struct_for_execute.get("risk_level") == "L2":
+                                if approval_actor_role != "IT Admin":
+                                    approval_status = "rejected"
+                                    execution_result = "rejected_l2_requires_it_admin"
+                                else:
+                                    approval_status = "approved"
+                                    current_labels = github_bot.get_issue_labels(args.repo, args.issue_number)
+                                    if "status:approved" in (current_labels or []):
+                                        execution_result = "already_approved_skip"
+                                        executed_actions = []
+                                    else:
+                                        base_labels = list(struct_for_execute.get("labels_to_add") or [])
+
+                                        # Keep only non-status labels (e.g., cat:* and prio:*)
+                                        labels = [lb for lb in base_labels if not str(lb).startswith("status:")]
+
+                                        # Set final status
+                                        labels.append("status:approved")
+
+                                        if labels:
+                                            github_bot.add_labels(
+                                                args.repo,
+                                                args.issue_number,
+                                                labels,
+                                                remove_prefixes=["status:"],  # remove any existing status:* before adding the new one
+                                            )
+                                            executed_actions.append("add_labels")
+
+                                        if struct_for_execute.get("assignees"):
+                                            github_bot.add_assignees(args.repo, args.issue_number, struct_for_execute["assignees"])
+                                            executed_actions.append("add_assignees")
+                                        github_bot.post_comment(args.repo, args.issue_number, "## Executed actions\n\n" + json.dumps({"executed": executed_actions}, indent=2))
+                                        execution_result = "success"
+                            else:
+                                if approval_actor_role not in ("Engineer", "IT Admin"):
+                                    approval_status = "rejected"
+                                    execution_result = "rejected_l1_requires_engineer_or_admin"
+                                else:
+                                    approval_status = "approved"
+                                    current_labels = github_bot.get_issue_labels(args.repo, args.issue_number)
+                                    if "status:approved" in (current_labels or []):
+                                        execution_result = "already_approved_skip"
+                                        executed_actions = []
+                                    else:
+                                        base_labels = list(struct_for_execute.get("labels_to_add") or [])
+
+                                        # Keep only non-status labels (e.g., cat:* and prio:*)
+                                        labels = [lb for lb in base_labels if not str(lb).startswith("status:")]
+
+                                        # Set final status
+                                        labels.append("status:approved")
+
+                                        if labels:
+                                            github_bot.add_labels(
+                                                args.repo,
+                                                args.issue_number,
+                                                labels,
+                                                remove_prefixes=["status:"],  # remove any existing status:* before adding the new one
+                                            )
+                                            executed_actions.append("add_labels")
+
+                                        if struct_for_execute.get("assignees"):
+                                            github_bot.add_assignees(args.repo, args.issue_number, struct_for_execute["assignees"])
+                                            executed_actions.append("add_assignees")
+                                        github_bot.post_comment(args.repo, args.issue_number, "## Executed actions\n\n" + json.dumps({"executed": executed_actions}, indent=2))
+                                        execution_result = "success"
+                        else:
+                            approval_status = "approved"
+                            execution_result = "skipped"
+                    else:
+                        approval_status = "rejected"
+                        execution_result = "approver_not_in_directory"
+                else:
+                    if plan_comment is None:
+                        execution_result = "no_proposed_plan"
+                audit_record["approval_status"] = approval_status
+                audit_record["approval_actor_login"] = approval_actor_login or ""
+                audit_record["approval_actor_role"] = approval_actor_role or ""
+                audit_record["executed_actions"] = executed_actions if isinstance(executed_actions, list) else []
+                audit_record["execution_result"] = execution_result
+        except Exception as e:
+            audit_record["execution_result"] = "error"
+            audit_record["error"] = str(e)
+            audit_record["executed_actions"] = []
+            output["debug"]["github_error"] = str(e)
+        latency_ms = round((_time.perf_counter() - _start_audit) * 1000)
+        audit_record["latency_ms"] = latency_ms
+        audit.append_jsonl(audit_record, path=audit_path, repo_root=repo_root)
+    else:
+        latency_ms = round((_time.perf_counter() - _start_audit) * 1000)
+        audit_record["latency_ms"] = latency_ms
+        audit_record["approval_status"] = "n/a"
+        audit_record["execution_result"] = "n/a"
+        from . import audit as _audit
+        _audit.append_jsonl(audit_record, path=audit_path, repo_root=repo_root)
+
     print(json.dumps(output, indent=2))
 
 
