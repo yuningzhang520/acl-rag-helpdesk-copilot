@@ -1,0 +1,9 @@
+user_id,github_username,display_name,role,restricted_grant,notes
+u001,alice-lee,Alice Lee,Employee,false,Standard business user
+u002,bob-chen,Bob Chen,Employee,false,Standard business user
+u003,carla-gomez,Carla Gomez,Engineer,false,Can access internal runbooks only
+u004,david-singh,David Singh,Engineer,true,Engineer with explicit restricted grant (exception)
+u005,eva-muller,Eva Müller,IT Admin,true,Privileged operator
+u006,frank-oneil,Frank O'Neil,Employee,false,Standard business user
+u007,grace-kim,Grace Kim,Engineer,false,Can access internal runbooks only
+u008,henry-patel,Henry Patel,IT Admin,true,Privileged operator
