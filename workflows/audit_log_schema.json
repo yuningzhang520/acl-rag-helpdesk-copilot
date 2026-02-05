@@ -1,0 +1,149 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "ACL RAG Helpdesk Copilot - Audit Log Record",
+    "type": "object",
+    "additionalProperties": true,
+    "required": [
+      "timestamp",
+      "repo",
+      "issue_number",
+      "requester_user_id",
+      "requester_role",
+      "allowed_tiers",
+      "triage",
+      "retrieval_confidence",
+      "retrieved",
+      "citations",
+      "proposed_actions_struct",
+      "approval_status",
+      "approval_actor_login",
+      "approval_actor_role",
+      "executed_actions",
+      "execution_result",
+      "latency_ms",
+      "estimated_cost"
+    ],
+    "properties": {
+      "timestamp": {
+        "type": "string",
+        "description": "UTC timestamp in ISO8601 format, e.g. 2026-02-04T13:46:28Z"
+      },
+      "repo": {
+        "type": "string",
+        "description": "GitHub repo in owner/name format when in github mode; empty otherwise"
+      },
+      "issue_number": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "GitHub issue number when in github mode; 0 otherwise"
+      },
+      "requester_user_id": {
+        "type": "string",
+        "description": "User ID from workflows/directory.csv"
+      },
+      "requester_role": {
+        "type": "string",
+        "description": "Resolved role of requester (Employee/Engineer/IT Admin)"
+      },
+      "allowed_tiers": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "ACL tiers allowed for requester"
+      },
+      "triage": {
+        "type": "object",
+        "required": ["category", "priority", "method"],
+        "properties": {
+          "category": { "type": "string" },
+          "priority": { "type": "string" },
+          "method": { "type": "string" }
+        },
+        "description": "Deterministic triage output"
+      },
+      "retrieval_confidence": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Retrieval confidence score in [0,1]"
+      },
+      "retrieved": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["doc", "section", "tier", "score"],
+          "properties": {
+            "doc": { "type": "string" },
+            "section": { "type": "string" },
+            "tier": { "type": "string" },
+            "score": { "type": "number" }
+          }
+        },
+        "description": "Retrieved sections used to build answer"
+      },
+      "citations": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["doc", "section", "anchor", "tier"],
+          "properties": {
+            "doc": { "type": "string" },
+            "section": { "type": "string" },
+            "anchor": { "type": "string" },
+            "tier": { "type": "string" }
+          }
+        },
+        "description": "Citations attached to answer"
+      },
+      "proposed_actions_struct": {
+        "type": "object",
+        "required": ["risk_level", "needs_approval", "approval_role", "labels_to_add", "assignees", "comment_summary"],
+        "properties": {
+          "risk_level": { "type": "string", "description": "L1 or L2" },
+          "needs_approval": { "type": "boolean" },
+          "approval_role": { "type": "string", "description": "Engineer or IT Admin" },
+          "labels_to_add": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "assignees": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "comment_summary": { "type": "string" }
+        },
+        "description": "Deterministic writeback plan (labels/assignees/etc.)"
+      },
+      "approval_status": {
+        "type": "string",
+        "description": "n/a | pending | approved | rejected"
+      },
+      "approval_actor_login": {
+        "type": "string",
+        "description": "GitHub login of approver when present"
+      },
+      "approval_actor_role": {
+        "type": "string",
+        "description": "Resolved role of approver from directory mapping"
+      },
+      "executed_actions": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "List of allowlisted operations executed, e.g. add_labels"
+      },
+      "execution_result": {
+        "type": "string",
+        "description": "Outcome label, e.g. propose_only / success / rejected_* / error"
+      },
+      "latency_ms": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "End-to-end runtime in milliseconds"
+      },
+      "estimated_cost": {
+        "type": ["number", "null"],
+        "minimum": 0,
+        "description": "Estimated API cost in USD (0 or null for mock mode)"
+      }
+    }
+  }
+  
