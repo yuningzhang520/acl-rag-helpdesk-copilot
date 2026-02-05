@@ -23,3 +23,10 @@ ENV/
 .DS_Store
 Thumbs.db
 workflows/audit_log.jsonl
+
+# generated
+.eval_results.csv
+eval_results.csv
+workflows/audit_log.jsonl
+__pycache__/
+*.pyc
