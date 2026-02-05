@@ -37,17 +37,34 @@ CATEGORY_KEYWORDS = {
     "VPN": ["vpn"],
     "MFA": ["mfa", "2fa", "multi-factor"],
     # Access: include common enterprise phrasing to reduce cat:Other
-    "Access": ["access", "permission", "grant", "iam", "role", "group", "shared drive", "drive", "folder", "sharepoint", "onedrive", "google drive"],
     "Onboarding": ["onboarding", "new hire"],
+    "Access": ["access", "permission", "grant", "iam", "role", "group", "shared drive", "drive", "folder", "sharepoint", "onedrive", "google drive"],
 }
 
 # Priority keywords
 PRIORITY_KEYWORDS = {
     "Critical": ["outage", "down", "many users", "widespread"],
-    "High": ["urgent", "blocked", "deadline", "critical"],
-    "Medium": ["soon", "annoying", "inconvenience"],
+    "High": [
+        "urgent", "blocked", "critical", "asap", "immediately",
+        "cannot sign in", "can't sign in", "unable to sign in",
+        "cannot login", "can't login", "unable to login",
+        "lost my phone", "lost phone", "mfa reset",
+        "looping", "stuck", "locked out",
+        "security incident", "incident response", "security investigation",
+    ],
+    "Medium": [
+        "soon", "deadline soon",
+        "can't access", "cannot access", "unable to access",
+        "no access",
+        "doesn't work",
+        "no invite", "missing invite",
+        "cannot reach", "can't reach",
+        "cannot connect", "can't connect", "unable to connect",
+        "authentication failed", "auth failed",
+        "disconnects", "keeps disconnecting", "reconnecting", "reconnect",
+        "time-limited", "temporary", "contractor", "one week"
+    ],
 }
-
 
 def load_directory(csv_path: str) -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
     """
@@ -664,6 +681,7 @@ def main():
         "executed_actions": [],
         "execution_result": "n/a",
         "latency_ms": 0,
+        "estimated_cost": 0,
     }
     if args.mode == "github":
         from . import github_bot
