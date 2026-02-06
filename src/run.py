@@ -299,6 +299,46 @@ def triage_issue(issue_text: str) -> Dict[str, str]:
     
     return {"category": category, "priority": priority}
 
+def normalize_issue_text(issue_text: str, source: str) -> str:
+    """
+    Reduce noise from GitHub issue templates.
+    Keep title + key sections only to improve retrieval quality.
+    """
+    if source != "github_issue":
+        return issue_text.strip()
+
+    t = issue_text.strip()
+
+    # Keep only common template parts (light heuristic)
+    keep_lines = []
+    keep = False
+    for line in t.splitlines():
+        l = line.strip()
+
+        # Always keep title line(s)
+        if l and not keep_lines:
+            keep_lines.append(l)
+            continue
+
+        # Turn on keeping after these headers (adjust to your template)
+        if re.match(r"^###\s*(Description|Error|Impact|Steps tried|Steps to Reproduce|Environment)\b", l, flags=re.I):
+            keep = True
+            keep_lines.append(l)
+            continue
+
+        # Turn off keeping after unrelated headers
+        if re.match(r"^###\s*(Request Type|Urgency|User Role|Sensitivity|Incident/Request Timestamp|Target Resolution Date)\b", l, flags=re.I):
+            keep = False
+            continue
+
+        if keep:
+            # skip empty boilerplate checkbox line etc.
+            if l and l != "- [ ]":
+                keep_lines.append(l)
+
+    out = "\n".join(keep_lines).strip()
+    return out if out else issue_text.strip()
+
 def build_proposed_actions_struct(
     triage: Dict[str, str],
     proposed_actions: List[str],
@@ -317,10 +357,8 @@ def build_proposed_actions_struct(
         approval_role = "Engineer"
         needs_approval = False
 
-    labels_to_add = []
-    if mode == "github":
-        status = "status:pending-approval" if needs_approval else "status:triaged"
-        labels_to_add = [f"cat:{category}", f"prio:{priority}", status]
+    status = "status:pending-approval" if needs_approval else "status:triaged"
+    labels_to_add = [f"cat:{category}", f"prio:{priority}", status]
 
     assignees = []
     comment_summary = "Proposed: " + "; ".join((proposed_actions or [])[:3]) if proposed_actions else "No actions"
@@ -402,6 +440,57 @@ def build_source_catalog(context_sections: List[Dict]) -> Tuple[List[Dict[str, A
 
     return sources, source_map
 
+def _pick_best_line(text: str) -> str:
+    """
+    Pick a short, actionable line from a section.
+    Filters out template checklist noise and strips list prefixes.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    def is_noise(ln: str) -> bool:
+        # template checkboxes / boilerplate
+        if re.match(r"^\-\s*\[\s*[xX ]\s*\]\s*", ln):
+            return True
+        if ln.lower().startswith(("use this runbook when", "purpose:", "objective:", "risk level:", "action type:")):
+            return True
+        return False
+
+    def clean_prefix(ln: str) -> str:
+        # remove "- ", "* ", "1. " etc.
+        ln = re.sub(r"^(\-|\*|\+)\s+", "", ln)
+        ln = re.sub(r"^\d+\.\s+", "", ln)
+        return ln.strip()
+
+    # 1) prefer explicit steps / bullets, but skip noise
+    for ln in lines:
+        if is_noise(ln):
+            continue
+        if re.match(r"^(\d+\.|\- |\* |\+ )", ln):
+            return clean_prefix(ln)
+
+    # 2) heuristic imperative-ish lines
+    for ln in lines:
+        if is_noise(ln):
+            continue
+        if re.match(r"^(confirm|ensure|check|retry|restart|open|disconnect|reconnect|verify|sign in|sign-in)\b", ln, flags=re.I):
+            return clean_prefix(ln)
+
+    # 3) first non-heading non-noise line
+    for ln in lines:
+        if is_noise(ln):
+            continue
+        if not ln.startswith("#"):
+            return clean_prefix(ln)
+
+    # final fallback: first non-noise line
+    for ln in lines:
+        if not is_noise(ln):
+            return clean_prefix(ln)
+
+    return ""
+
 def _deterministic_intermediate(context_sections: List[Dict], issue_text: str) -> Dict[str, Any]:
     if not context_sections:
         return {
@@ -430,23 +519,28 @@ def _deterministic_intermediate(context_sections: List[Dict], issue_text: str) -
 
     bullets: List[Dict[str, str]] = []
     for src in sources[:5]:
-        excerpt = src["content"]
-        if len(excerpt) > 180:
-            excerpt = excerpt[:180].rstrip() + "..."
+        best = _pick_best_line(src.get("content", ""))
+        if not best:
+            # fallback if content is empty
+            best = f'{src["doc_name"]} — {src["heading"]}'
+        if len(best) > 160:
+            best = best[:160].rstrip() + "..."
         bullets.append({
-            "text": f'{src["doc_name"]} — {src["heading"]}: {excerpt}',
+            "text": best,
             "source_id": src["source_id"],
         })
-        if len(bullets) >= 5:
-            break
 
     while len(bullets) < 2:
         bullets.append({"text": "Review the retrieved runbook sections and follow the documented steps.", "source_id": "N/A"})
 
     issue_lower = issue_text.lower()
     needs_details = any(k in issue_lower for k in ["cannot", "can't", "unable", "not working", "doesn't work", "error"])
+
+    # If issue already includes an explicit error line, don't ask for it again
+    has_explicit_error = ("error:" in issue_lower) or ("authentication failed" in issue_lower) or ('stuck at "connecting"' in issue_lower) or ("stuck at 'connecting'" in issue_lower)
+
     clarifying = ""
-    if needs_details:
+    if needs_details and not has_explicit_error:
         clarifying = "Which system/app is this for, and what is the exact error message (copy/paste if possible)?"
 
     return {
@@ -587,6 +681,157 @@ def build_intermediate(
         det.pop("_retrieval_confidence_num", None)
         return det, {"used_llm": False, "fallback_reason": f"llm_error:{str(e)}"}
 
+# ---------------------------
+# Proposal Builder (LLM propose, guarded)
+# ---------------------------
+
+ALLOWED_STATUS_LABELS = {"status:pending-approval", "status:triaged", "status:approved"}
+
+def _validate_proposal(obj: Any) -> Tuple[bool, str]:
+    """
+    Proposal is intentionally narrow and safe.
+    Allowed keys: comment_summary(str), assignees(list[str]).
+    Everything else will be ignored by guard anyway.
+    """
+    if not isinstance(obj, dict):
+        return False, "not_a_dict"
+
+    # comment_summary is optional but if present must be short
+    if "comment_summary" in obj:
+        cs = obj.get("comment_summary")
+        if not isinstance(cs, str):
+            return False, "comment_summary_not_string"
+        if len(cs) > 300:
+            return False, "comment_summary_too_long"
+
+    # assignees optional
+    if "assignees" in obj:
+        a = obj.get("assignees")
+        if not isinstance(a, list):
+            return False, "assignees_not_list"
+        if not all(isinstance(x, str) for x in a):
+            return False, "assignees_not_strings"
+        if len(a) > 10:
+            return False, "assignees_too_many"
+
+    return True, ""
+
+def _call_openai_proposal(api_key: str, model: str, issue_text: str, triage: Dict[str, str], intermediate: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    LLM propose a human-readable comment_summary + optional assignees.
+    IMPORTANT:
+    - LLM does NOT decide risk/approval/labels.
+    - Output JSON only.
+    """
+    # Keep intermediate compact
+    bullets = intermediate.get("bullets") or []
+    cq = (intermediate.get("clarifying_question") or "").strip()
+    bullets_text = "\n".join([
+        f"- {(b.get('text','') if isinstance(b, dict) else str(b))}"
+        for b in bullets[:5]
+    ])
+    cq_text = f"\nClarifying question: {cq}" if cq else ""
+
+    system_msg = (
+        "You are an IT helpdesk assistant that writes a short proposed plan summary.\n"
+        "Return STRICT JSON only. No markdown.\n"
+        "Allowed keys:\n"
+        "- comment_summary: a concise summary for a GitHub comment (<= 200 chars preferred)\n"
+        "- assignees: optional list of GitHub usernames (strings), usually empty\n"
+        "Rules:\n"
+        "- Do not invent actions beyond the provided bullets.\n"
+        "- Do not include labels/risk/approval in the output.\n"
+    )
+
+    user_msg = (
+        f"User issue:\n{issue_text}\n\n"
+        f"Triage:\ncategory={triage.get('category')} priority={triage.get('priority')}\n\n"
+        f"Evidence bullets:\n{bullets_text}{cq_text}\n\n"
+        "Return JSON."
+    )
+
+    raw = call_openai_chat(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        max_tokens=120,
+        temperature=0.2,
+    )
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if m:
+            return json.loads(m.group(0))
+        raise
+
+def build_proposal(
+    issue_text: str,
+    triage: Dict[str, str],
+    intermediate: Dict[str, Any],
+    use_llm: bool,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Returns: (proposal, meta)
+    proposal is optional dict with keys comment_summary/assignees.
+    meta includes used_llm and fallback_reason.
+    """
+    if not use_llm:
+        return None, {"used_llm": False, "fallback_reason": ""}
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None, {"used_llm": False, "fallback_reason": "no_openai_api_key"}
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    try:
+        obj = _call_openai_proposal(api_key, model, issue_text, triage, intermediate)
+        ok, reason = _validate_proposal(obj)
+        if not ok:
+            return None, {"used_llm": False, "fallback_reason": f"invalid_proposal:{reason}"}
+        return obj, {"used_llm": True, "fallback_reason": ""}
+    except Exception as e:
+        return None, {"used_llm": False, "fallback_reason": f"llm_error:{str(e)}"}
+
+def merge_and_guard_proposed_struct(
+    base_struct: Dict[str, Any],
+    triage: Dict[str, str],
+    mode: str,
+    proposal: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Guard rail:
+    - NEVER trust LLM for risk_level / needs_approval / approval_role / labels_to_add.
+    - Only allow LLM to improve comment_summary (and optionally assignees if allowlisted).
+    """
+    out = dict(base_struct or {})
+
+    # Deterministic labels override (enterprise safe) — always compute
+    cat = triage.get("category", "Other")
+    prio = triage.get("priority", "Low")
+    status = "status:pending-approval" if out.get("needs_approval") else "status:triaged"
+    out["labels_to_add"] = [f"cat:{cat}", f"prio:{prio}", status]
+
+    # LLM-proposed comment summary (safe)
+    if proposal and isinstance(proposal, dict):
+        cs = proposal.get("comment_summary")
+        if isinstance(cs, str) and cs.strip():
+            out["comment_summary"] = cs.strip()[:300]
+
+        # assignees: keep empty unless you explicitly allowlist later
+        # If you want allowlist:
+        # allowed_assignees = set(["oncall-engineer", "it-admin-1"])
+        # a = proposal.get("assignees")
+        # if isinstance(a, list):
+        #     out["assignees"] = [x for x in a if isinstance(x, str) and x in allowed_assignees][:10]
+
+    return out
+
 def call_openai_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int = 500, temperature: float = 0.3) -> str:
     """
     Minimal OpenAI Chat Completions call using stdlib urllib (no external deps).
@@ -657,6 +902,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=3, help="Number of sections to retrieve (default: 3)")
     parser.add_argument("--mode", choices=["cli", "github"], default="cli", help="Output channel: cli prints JSON to stdout; github posts to GitHub (default: cli)")
     parser.add_argument("--llm_intermediate", action="store_true", help="Use OpenAI to build intermediate JSON (bullets + optional clarifying question). Default off.")
+    parser.add_argument("--llm_propose", action="store_true", help="Use OpenAI to propose a plan/summary for GitHub comment (proposal only). Default off.")
     parser.add_argument("--role_override", help="Override role if user_id not found (Employee/Engineer/IT Admin)")
     parser.add_argument("--repo", help="GitHub repo owner/name (required for --mode github)")
     parser.add_argument("--issue_number", type=int, help="GitHub issue number (required for --mode github)")
@@ -713,6 +959,9 @@ def main():
         }
         print(json.dumps(error_output, indent=2))
         sys.exit(1)
+
+    issue_text_raw = issue_text
+    issue_text = normalize_issue_text(issue_text, issue_text_source)
 
     # Load directory
     repo_root = Path(__file__).parent.parent
@@ -792,10 +1041,28 @@ def main():
         "intermediate_meta": intermediate_meta,
     }
 
-    # Triage
+    # Triage (deterministic)
     triage_data = triage_issue(issue_text)
+
+    # Base proposed_actions_struct (deterministic gate)
     proposed_actions_struct = build_proposed_actions_struct(
         triage_data, answer_data["proposed_actions"], args.mode
+    )
+
+    # LLM propose (optional, plan-writing only)
+    proposal, proposal_meta = build_proposal(
+        issue_text=issue_text,
+        triage=triage_data,
+        intermediate=intermediate,
+        use_llm=bool(args.llm_propose),
+    )
+
+    # Guarded merge: never trust LLM for risk/approval/labels
+    proposed_actions_struct = merge_and_guard_proposed_struct(
+        base_struct=proposed_actions_struct,
+        triage=triage_data,
+        mode=args.mode,
+        proposal=proposal,
     )
 
     # Build base output (triage_method=keyword, retrieval_confidence)
@@ -808,6 +1075,8 @@ def main():
         "citations": answer_data["citations"],
         **({"intermediate": answer_data.get("intermediate", {})} if args.llm_intermediate else {}),
         **({"intermediate_meta": answer_data.get("intermediate_meta", {})} if args.llm_intermediate else {}),
+        **({"proposal": proposal} if args.llm_propose else {}),
+        **({"proposal_meta": proposal_meta} if args.llm_propose else {}),
         "triage": triage_data,
         "triage_method": "keyword",
         "retrieval_confidence": answer_data["confidence"],
@@ -819,7 +1088,9 @@ def main():
             "allowed_tiers": allowed_tiers,
             "issue_text_source": issue_text_source,
             "issue_text_preview": issue_text[:200],
+            "issue_text_preview_raw": issue_text_raw[:200],
             "retrieved": debug_retrieved,
+            "llm_propose": bool(args.llm_propose),
         },
     }
 
@@ -847,6 +1118,9 @@ def main():
         "estimated_cost": 0,
         "issue_text_source": issue_text_source,
         "issue_text_len": len(issue_text),
+        "llm_propose": bool(args.llm_propose),
+        "proposal_meta": proposal_meta if args.llm_propose else {},
+        "issue_text_len_raw": len(issue_text_raw),
     }
     if args.mode == "github":
         from . import github_bot
@@ -863,6 +1137,7 @@ def main():
                 # Only post Proposed Plan and exit (no approval checks)
                 plan_body = (
                     "## Proposed Plan (PENDING APPROVAL)\n\n"
+                    + (proposed_actions_struct.get("comment_summary","").strip() + "\n\n" if proposed_actions_struct.get("comment_summary") else "")
                     + answer_data["answer"]
                     + "\n\n### Intermediate (evidence summary)\n```json\n"
                     + json.dumps(answer_data.get("intermediate", {}), indent=2)
@@ -873,6 +1148,12 @@ def main():
                     + "\n### Proposed actions (struct)\n```json\n"
                     + json.dumps(proposed_actions_struct, indent=2)
                     + "\n```"
+                    + "\n\n### Proposal meta\n```json\n"
+                    + json.dumps(proposal_meta if args.llm_propose else {}, indent=2)
+                    + "\n```\n"
+                    + "\n### Proposal (LLM)\n```json\n"
+                    + json.dumps(proposal if args.llm_propose else {}, indent=2)
+                    + "\n```\n"
                 )
 
                 github_bot.post_comment(args.repo, args.issue_number, plan_body)
