@@ -53,6 +53,17 @@ def _req_list(method: str, url: str, timeout: float = 30) -> List[Dict[str, Any]
         raw = resp.read().decode("utf-8")
         return json.loads(raw) if raw else []
 
+def get_issue(repo: str, issue_number: int) -> Dict[str, Any]:
+    """
+    Get a GitHub issue. Returns {title, body, ...}.
+    Allowlisted read operation.
+    """
+    url = f"{_base_url(repo)}/issues/{issue_number}"
+    try:
+        return _req("GET", url)
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"GitHub API get_issue failed {e.code}: {err}") from e
 
 def list_comments(repo: str, issue_number: int) -> List[Dict[str, Any]]:
     """

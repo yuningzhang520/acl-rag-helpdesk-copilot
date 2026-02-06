@@ -5,12 +5,19 @@ MVP Retrieval + Citations + ACL Pipeline
 Demo commands demonstrating ACL enforcement:
 
 Example A (Employee - should NOT see restricted docs):
-  python -m src.run --user_id u001 --issue "How do I grant access to a shared drive?"
+  python -m src.run --mode cli --user_id u001 --issue "How do I grant access to a shared drive?"
 
 Example B (IT Admin - CAN see restricted docs):
-  python -m src.run --user_id u005 --issue "How do I grant access to a shared drive?"
+  python -m src.run --mode cli --user_id u005 --issue "How do I grant access to a shared drive?"
 
-The same issue text should retrieve different documents based on user role.
+Enable LLM intermediate compression (optional):
+  python -m src.run --mode cli --llm_intermediate --user_id u001 --issue "How do I grant access to a shared drive?"
+
+GitHub propose:
+  python -m src.run --mode github --user_id u005 --repo owner/name --issue_number 12 --issue "How do I grant access to a shared drive?"
+
+GitHub execute:
+  python -m src.run --mode github --github_stage execute --user_id u005 --repo owner/name --issue_number 12 --issue "How do I grant access to a shared drive?"
 """
 
 import argparse
@@ -24,6 +31,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from typing import Any
 
 # Role → allowed permission tiers mapping
 ROLE_TIER_MAP = {
@@ -291,42 +299,31 @@ def triage_issue(issue_text: str) -> Dict[str, str]:
     
     return {"category": category, "priority": priority}
 
-
 def build_proposed_actions_struct(
     triage: Dict[str, str],
     proposed_actions: List[str],
     mode: str,
 ) -> Dict:
-    """
-    risk_level: L2 only when category == "Access"; High/Critical alone do not trigger L2.
-    Else L1 if writeback planned; else needs_approval=false.
-    L1 -> approval_role Engineer (or IT Admin). L2 -> approval_role IT Admin.
-    Employee approvals are invalid (enforced at validation time).
-    """
     category = triage.get("category", "Other")
     priority = triage.get("priority", "Low")
-    writeback_planned = mode == "github" and bool(proposed_actions)
 
-    # L2 only when category == "Access"; High/Critical alone do not trigger L2
+    # ✅ Only Access requires approval (L2). Everything else is triaged without approval.
     if category == "Access":
         risk_level = "L2"
         approval_role = "IT Admin"
         needs_approval = True
-    elif writeback_planned:
-        risk_level = "L1"
-        approval_role = "Engineer"
-        needs_approval = True
     else:
-        risk_level = "L1"  # placeholder when no approval needed
+        risk_level = "L1"
         approval_role = "Engineer"
         needs_approval = False
 
-    # Enterprise label format: cat:<Category>, prio:<Priority>, status:pending-approval | status:approved
     labels_to_add = []
     if mode == "github":
-        labels_to_add = [f"cat:{category}", f"prio:{priority}", "status:pending-approval"]
-    assignees = []  # allowlisted; could be config-driven later
-    comment_summary = "Proposed: " + "; ".join(proposed_actions[:3]) if proposed_actions else "No actions"
+        status = "status:pending-approval" if needs_approval else "status:triaged"
+        labels_to_add = [f"cat:{category}", f"prio:{priority}", status]
+
+    assignees = []
+    comment_summary = "Proposed: " + "; ".join((proposed_actions or [])[:3]) if proposed_actions else "No actions"
 
     return {
         "risk_level": risk_level,
@@ -336,7 +333,6 @@ def build_proposed_actions_struct(
         "assignees": assignees,
         "comment_summary": comment_summary,
     }
-
 
 def _parse_proposed_plan_struct_from_comment(body: str) -> Optional[Dict]:
     """Extract proposed_actions_struct from a Proposed Plan comment body (```json ... ```)."""
@@ -378,66 +374,218 @@ def _find_latest_proposed_plan_and_approve(
             break
     return plan_comment, struct, approve_comment
 
+# ---------------------------
+# Intermediate Builder (unified)
+# ---------------------------
 
-def generate_answer_mock(context_sections: List[Dict], issue_text: str) -> Dict:
-    """Generate mock answer with citations (public-safe) based on retrieved sections."""
+def build_source_catalog(context_sections: List[Dict]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, str]]]:
+    """
+    sources: list for LLM prompt
+    source_map: source_id -> {doc_name, anchor, heading}
+    """
+    sources: List[Dict[str, Any]] = []
+    source_map: Dict[str, Dict[str, str]] = {}
+
+    for i, s in enumerate(context_sections, start=1):
+        source_id = f"S{i}"
+        doc_name = Path(s["doc_path"]).name
+        anchor = s.get("anchor", "")
+        heading = s.get("heading", "")
+        sources.append({
+            "source_id": source_id,
+            "doc_name": doc_name,
+            "anchor": anchor,
+            "heading": heading,
+            "content": (s.get("content") or "").strip(),
+        })
+        source_map[source_id] = {"doc_name": doc_name, "anchor": anchor, "heading": heading}
+
+    return sources, source_map
+
+def _deterministic_intermediate(context_sections: List[Dict], issue_text: str) -> Dict[str, Any]:
     if not context_sections:
         return {
-            "answer": "I don't have enough information in the accessible runbooks to answer this. Please provide more details or escalate via your organization’s official IT support process.",
-            "citations": [],
-            "confidence": 0.0,
-            "proposed_actions": ["Escalate (see Escalation)"],
+            "bullets": [
+                {"text": "No accessible runbook sections were retrieved for this request.", "source_id": "N/A"},
+                {"text": "Escalate through the official IT support process or provide more details.", "source_id": "N/A"},
+            ],
+            "clarifying_question": "What system/app and exact error message are you seeing?",
+            "confidence_level": "Low",
+            "confidence_reason": "No retrieved evidence available in accessible tiers.",
         }
 
-    answer_parts = []
-    citations = []
-
-    # Use max_score to compute confidence
     max_score = max((s.get("score", 0) for s in context_sections), default=0)
-    conf = confidence_from_max_score(max_score, k=12.0)
+    conf_num = confidence_from_max_score(max_score, k=12.0)
     if max_score == 0:
-        conf = 0.25  # fallback confidence: low but non-zero
+        conf_num = 0.25
 
-    for section in context_sections:
-        doc_path = section["doc_path"]
-        doc_name = Path(doc_path).name
-        heading = section["heading"]
-        anchor = section.get("anchor", "")
+    if conf_num >= 0.70:
+        conf_level = "High"
+    elif conf_num >= 0.45:
+        conf_level = "Medium"
+    else:
+        conf_level = "Low"
 
-        # Keep answer concise: short excerpt only
-        excerpt = section["content"].strip()
-        if len(excerpt) > 220:
-            excerpt = excerpt[:220].rstrip() + "..."
+    sources, _ = build_source_catalog(context_sections)
 
-        answer_parts.append(f"- From **{doc_name}** {anchor} (**{heading}**): {excerpt}")
-
-        citations.append({
-            "doc": doc_path,
-            "section": heading,
-            "anchor": anchor,
-            "tier": section["tier"],
+    bullets: List[Dict[str, str]] = []
+    for src in sources[:5]:
+        excerpt = src["content"]
+        if len(excerpt) > 180:
+            excerpt = excerpt[:180].rstrip() + "..."
+        bullets.append({
+            "text": f'{src["doc_name"]} — {src["heading"]}: {excerpt}',
+            "source_id": src["source_id"],
         })
+        if len(bullets) >= 5:
+            break
 
-    answer = "Here’s what the runbooks say based on your question:\n" + "\n".join(answer_parts)
+    while len(bullets) < 2:
+        bullets.append({"text": "Review the retrieved runbook sections and follow the documented steps.", "source_id": "N/A"})
 
-    proposed_actions = []
-    txt = issue_text.lower()
-    if "vpn" in txt:
-        proposed_actions.append("Follow the VPN runbook steps")
-    if "mfa" in txt or "2fa" in txt:
-        proposed_actions.append("Follow the password/MFA guidance runbook")
-    if "access" in txt or "permission" in txt or "grant" in txt:
-        proposed_actions.append("Use the official access request process and include approvals")
-
-    if not proposed_actions:
-        proposed_actions = ["Review the cited sections and follow the steps"]
+    issue_lower = issue_text.lower()
+    needs_details = any(k in issue_lower for k in ["cannot", "can't", "unable", "not working", "doesn't work", "error"])
+    clarifying = ""
+    if needs_details:
+        clarifying = "Which system/app is this for, and what is the exact error message (copy/paste if possible)?"
 
     return {
-        "answer": answer,
-        "citations": citations,
-        "confidence": conf,
-        "proposed_actions": proposed_actions,
+        "bullets": bullets[:5],
+        "clarifying_question": clarifying,
+        "confidence_level": conf_level,
+        "confidence_reason": f"Derived from retrieval max_score={max_score} (confidence={conf_num:.2f}).",
+        "_retrieval_confidence_num": conf_num,
     }
+
+def _validate_intermediate(obj: Any, source_map: Dict[str, Dict[str, str]]) -> Tuple[bool, str]:
+    if not isinstance(obj, dict):
+        return False, "not_a_dict"
+
+    for k in ["bullets", "clarifying_question", "confidence_level", "confidence_reason"]:
+        if k not in obj:
+            return False, f"missing_field:{k}"
+
+    bullets = obj.get("bullets")
+    if not isinstance(bullets, list) or not (2 <= len(bullets) <= 5):
+        return False, "bullets_count_out_of_range"
+
+    for b in bullets:
+        if not isinstance(b, dict):
+            return False, "bullet_not_object"
+        text = b.get("text")
+        sid = b.get("source_id")
+        if not isinstance(text, str) or not text.strip():
+            return False, "bullet_text_invalid"
+        if not isinstance(sid, str) or not sid.strip():
+            return False, "bullet_source_id_invalid"
+        if sid != "N/A" and sid not in source_map:
+            return False, "bullet_source_id_not_in_sources"
+
+    cq = obj.get("clarifying_question")
+    if not isinstance(cq, str):
+        return False, "clarifying_question_not_string"
+    if cq and len(cq) > 240:
+        return False, "clarifying_question_too_long"
+
+    cl = obj.get("confidence_level")
+    if cl not in ("High", "Medium", "Low"):
+        return False, "invalid_confidence_level"
+
+    cr = obj.get("confidence_reason")
+    if not isinstance(cr, str) or not cr.strip():
+        return False, "confidence_reason_invalid"
+
+    return True, ""
+
+def _call_openai_intermediate(api_key: str, model: str, issue_text: str, context_sections: List[Dict]) -> Dict[str, Any]:
+    sources, _ = build_source_catalog(context_sections)
+
+    compact_sources = []
+    for s in sources:
+        content = s["content"]
+        if len(content) > 700:
+            content = content[:700].rstrip() + "..."
+        compact_sources.append({
+            "source_id": s["source_id"],
+            "doc_name": s["doc_name"],
+            "anchor": s["anchor"],
+            "heading": s["heading"],
+            "content": content,
+        })
+
+    system_msg = (
+        "You are an internal IT helpdesk pipeline component.\n"
+        "Return STRICT JSON only (no markdown, no extra text).\n"
+        "Use ONLY the provided sources. Do not add any new facts.\n"
+        "bullets must be 2-5 items. Each bullet MUST be an object:\n"
+        '  {"text": "...", "source_id": "S1"}\n'
+        "source_id MUST be one of the provided source_id values.\n"
+        "clarifying_question: empty string OR ONE question.\n"
+        "confidence_level: High/Medium/Low.\n"
+        "confidence_reason: short.\n"
+    )
+
+    user_msg = (
+        f"User request:\n{issue_text}\n\n"
+        f"Sources (JSON):\n{json.dumps(compact_sources, ensure_ascii=False)}\n\n"
+        "Return JSON with keys: bullets, clarifying_question, confidence_level, confidence_reason."
+    )
+
+    raw = call_openai_chat(
+        api_key=api_key,
+        model=model,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        max_tokens=450,
+        temperature=0.2,
+    )
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if m:
+            return json.loads(m.group(0))
+        raise
+
+def build_intermediate(
+    context_sections: List[Dict],
+    issue_text: str,
+    use_llm: bool,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Unified intermediate builder.
+    Returns: (intermediate, meta)
+      meta includes: used_llm(bool), fallback_reason(str)
+    """
+    # Always have deterministic fallback ready
+    det = _deterministic_intermediate(context_sections, issue_text)
+
+    if not use_llm:
+        # Strip internal helper if present
+        det.pop("_retrieval_confidence_num", None)
+        return det, {"used_llm": False, "fallback_reason": ""}
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        det.pop("_retrieval_confidence_num", None)
+        return det, {"used_llm": False, "fallback_reason": "no_openai_api_key"}
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    _, source_map = build_source_catalog(context_sections)
+
+    try:
+        obj = _call_openai_intermediate(api_key, model, issue_text, context_sections)
+        ok, reason = _validate_intermediate(obj, source_map)
+        if not ok:
+            det.pop("_retrieval_confidence_num", None)
+            return det, {"used_llm": False, "fallback_reason": f"invalid_intermediate:{reason}"}
+        return obj, {"used_llm": True, "fallback_reason": ""}
+    except Exception as e:
+        det.pop("_retrieval_confidence_num", None)
+        return det, {"used_llm": False, "fallback_reason": f"llm_error:{str(e)}"}
 
 def call_openai_chat(api_key: str, model: str, messages: List[Dict], max_tokens: int = 500, temperature: float = 0.3) -> str:
     """
@@ -474,97 +622,41 @@ def call_openai_chat(api_key: str, model: str, messages: List[Dict], max_tokens:
     except Exception as e:
         raise RuntimeError(f"OpenAI request failed: {str(e)}") from e
 
-def generate_answer_openai(context_sections: List[Dict], issue_text: str) -> Dict:
-    """
-    If OPENAI_API_KEY is not set:
-      - Return retrieval+citations answer (mock) with a clear note (no API call).
-    If OPENAI_API_KEY is set:
-      - Call OpenAI and return a real LLM-generated answer grounded in retrieved sections.
-    """
-    api_key = os.getenv("OPENAI_API_KEY")
-    base = generate_answer_mock(context_sections, issue_text)
+def answer_from_intermediate(intermediate: Dict[str, Any], source_map: Optional[Dict[str, Dict[str, str]]] = None) -> Tuple[str, List[str]]:
+    bullets = intermediate.get("bullets") or []
+    cq = (intermediate.get("clarifying_question") or "").strip()
 
-    # No key: still demo retrieval + citations
-    if not api_key:
-        base["answer"] = (
-            "Note: OPENAI_API_KEY is not configured, so no LLM call was made.\n"
-            "Answer below is generated from retrieved runbook sections (ACL-filtered) with citations.\n\n"
-            + base["answer"]
-        )
-        return base
+    answer_lines = ["Here’s what the runbooks suggest (ACL-filtered):"]
+    for b in bullets:
+        if isinstance(b, dict):
+            text = (b.get("text") or "").strip()
+            sid = (b.get("source_id") or "").strip()
+            if source_map and sid in source_map:
+                meta = source_map[sid]
+                cite = f'({meta["doc_name"]}{meta["anchor"]})'
+                answer_lines.append(f"- {text} {cite}")
+            else:
+                answer_lines.append(f"- {text}")
+        else:
+            answer_lines.append(f"- {str(b)}")
 
-    # Key exists: call OpenAI for real
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    if cq:
+        answer_lines.append("")
+        answer_lines.append(f"Clarifying question: {cq}")
 
-    # Build compact context for the LLM
-    context_parts = []
-    for s in context_sections:
-        doc_name = Path(s["doc_path"]).name
-        heading = s["heading"]
-        anchor = s.get("anchor", "")
-        content = (s["content"] or "").strip()
-        if len(content) > 600:
-            content = content[:600].rstrip() + "..."
-        context_parts.append(
-            f"Document: {doc_name}\nSection: {heading}\nAnchor: {anchor}\nContent:\n{content}"
-        )
-    context = "\n\n---\n\n".join(context_parts)
+    proposed_actions = ["Follow the cited runbook steps"]
+    if cq:
+        proposed_actions.append("Provide requested details to proceed")
 
-    prompt = (
-        "You are an IT helpdesk assistant.\n"
-        "Answer the user's question using ONLY the provided runbook context.\n"
-        "If the context is insufficient, say so and suggest escalation via official IT support.\n\n"
-        "When referencing information, cite the source as (Document + Anchor).\n\n"
-        f"Context:\n{context}\n\n"
-        f"User question:\n{issue_text}\n"
-    )
-
-    try:
-        answer_text = call_openai_chat(
-            api_key=api_key,
-            model=model,
-            messages=[
-                {"role": "system", "content": "You answer using only provided context and include citations (Document + Anchor)."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,
-            temperature=0.3,
-        )
-
-        # Keep citations as the retrieved set (MVP). (Later you can parse and filter.)
-        citations = base["citations"]
-
-        # Confidence: combine retrieval confidence + small bump for successful LLM call
-        conf = min(1.0, base["confidence"] + 0.10)
-
-        proposed_actions = base["proposed_actions"]
-        if "escalat" in answer_text.lower():
-            # Keep public-safe wording
-            if "Escalate (see Escalation)" not in proposed_actions:
-                proposed_actions = proposed_actions + ["Escalate (see Escalation)"]
-
-        return {
-            "answer": answer_text,
-            "citations": citations,
-            "confidence": conf,
-            "proposed_actions": proposed_actions,
-        }
-
-    except Exception as e:
-        # If API fails, fall back to retrieval answer (still useful for demo)
-        base["answer"] = (
-            f"Note: OPENAI_API_KEY is configured, but the LLM call failed ({str(e)}).\n"
-            "Falling back to retrieval+citations answer.\n\n"
-            + base["answer"]
-        )
-        return base
+    return "\n".join(answer_lines), proposed_actions
 
 def main():
     parser = argparse.ArgumentParser(description="MVP Retrieval + Citations + ACL Pipeline")
     parser.add_argument("--user_id", required=True, help="User ID from directory.csv")
-    parser.add_argument("--issue", required=True, help="Issue/question text")
+    parser.add_argument("--issue", help="Issue/question text (optional in --mode github; will read from GitHub issue if omitted)")
     parser.add_argument("--top_k", type=int, default=3, help="Number of sections to retrieve (default: 3)")
-    parser.add_argument("--mode", choices=["mock", "openai", "github"], default="mock", help="Answer generation mode (default: mock)")
+    parser.add_argument("--mode", choices=["cli", "github"], default="cli", help="Output channel: cli prints JSON to stdout; github posts to GitHub (default: cli)")
+    parser.add_argument("--llm_intermediate", action="store_true", help="Use OpenAI to build intermediate JSON (bullets + optional clarifying question). Default off.")
     parser.add_argument("--role_override", help="Override role if user_id not found (Employee/Engineer/IT Admin)")
     parser.add_argument("--repo", help="GitHub repo owner/name (required for --mode github)")
     parser.add_argument("--issue_number", type=int, help="GitHub issue number (required for --mode github)")
@@ -585,6 +677,43 @@ def main():
         print(json.dumps(error_output, indent=2))
         sys.exit(1)
     
+    # Determine issue_text
+    issue_text = (args.issue or "").strip()
+    issue_text_source = "cli_arg" if issue_text else ""
+
+    if args.mode == "github" and not issue_text:
+        # Pull from GitHub issue (title + body)
+        from . import github_bot
+        try:
+            gh_issue = github_bot.get_issue(args.repo, args.issue_number)
+            title = (gh_issue.get("title") or "").strip()
+            body = (gh_issue.get("body") or "").strip()
+            issue_text = (title + "\n\n" + body).strip() if body else title
+            issue_text_source = "github_issue"
+        except Exception as e:
+            error_output = {
+                "answer": f"Error: --issue is missing and failed to read GitHub issue text: {str(e)}",
+                "citations": [],
+                "triage": {"category": "Other", "priority": "Low"},
+                "retrieval_confidence": 0.0,
+                "proposed_actions": [],
+                "debug": {"error": "github_issue_fetch_failed"},
+            }
+            print(json.dumps(error_output, indent=2))
+            sys.exit(1)
+
+    if not issue_text:
+        error_output = {
+            "answer": "Error: --issue is required in --mode cli (or provide --mode github with a valid issue_number).",
+            "citations": [],
+            "triage": {"category": "Other", "priority": "Low"},
+            "retrieval_confidence": 0.0,
+            "proposed_actions": [],
+            "debug": {"error": "missing_issue_text"},
+        }
+        print(json.dumps(error_output, indent=2))
+        sys.exit(1)
+
     # Load directory
     repo_root = Path(__file__).parent.parent
     directory_path = repo_root / "workflows" / "directory.csv"
@@ -625,16 +754,46 @@ def main():
     all_sections = load_allowed_documents(allowed_tiers, docs_root)
     
     # Retrieve top_k sections
-    retrieved = retrieve_top_k(all_sections, args.issue, args.top_k)
+    retrieved = retrieve_top_k(all_sections, issue_text, args.top_k)
+    _, source_map = build_source_catalog(retrieved)
     
-    # Generate answer
-    if args.mode == "mock":
-        answer_data = generate_answer_mock(retrieved, args.issue)
-    else:
-        answer_data = generate_answer_openai(retrieved, args.issue)
-    
+    # Build citations from retrieved sections (single source of truth)
+    citations = []
+    for section in retrieved:
+        citations.append({
+            "doc": section["doc_path"],
+            "section": section["heading"],
+            "anchor": section.get("anchor", ""),
+            "tier": section["tier"],
+        })
+
+    # Build intermediate (unified). 
+    # Enterprise-safe default: LLM intermediate is opt-in only
+    use_llm = bool(args.llm_intermediate)  # opt-in only
+    intermediate, intermediate_meta = build_intermediate(retrieved, issue_text, use_llm=use_llm)
+
+    # Final answer comes LINEARLY from intermediate (single truth)
+    answer_text, proposed_actions = answer_from_intermediate(intermediate, source_map=source_map)
+
+    # Retrieval confidence for output: prefer intermediate-derived if present, else deterministic helper
+    # If you kept det helper _retrieval_confidence_num, it was stripped before returning.
+    # So we compute from retrieval score again:
+    max_score = max((s.get("score", 0) for s in retrieved), default=0)
+    retrieval_conf = confidence_from_max_score(max_score, k=12.0)
+    if max_score == 0:
+        retrieval_conf = 0.25
+
+    answer_data = {
+        "answer": answer_text,
+        "citations": citations,
+        "confidence": retrieval_conf,  # keep as retrieval_confidence (system gating)
+        "proposed_actions": proposed_actions,
+        "intermediate": intermediate,
+        "intermediate_meta": intermediate_meta,
+    }
+
     # Triage
-    triage_data = triage_issue(args.issue)
+    triage_data = triage_issue(issue_text)
     proposed_actions_struct = build_proposed_actions_struct(
         triage_data, answer_data["proposed_actions"], args.mode
     )
@@ -647,6 +806,8 @@ def main():
     output = {
         "answer": answer_data["answer"],
         "citations": answer_data["citations"],
+        **({"intermediate": answer_data.get("intermediate", {})} if args.llm_intermediate else {}),
+        **({"intermediate_meta": answer_data.get("intermediate_meta", {})} if args.llm_intermediate else {}),
         "triage": triage_data,
         "triage_method": "keyword",
         "retrieval_confidence": answer_data["confidence"],
@@ -656,6 +817,8 @@ def main():
             "user_id": args.user_id,
             "role": role,
             "allowed_tiers": allowed_tiers,
+            "issue_text_source": issue_text_source,
+            "issue_text_preview": issue_text[:200],
             "retrieved": debug_retrieved,
         },
     }
@@ -682,6 +845,8 @@ def main():
         "execution_result": "n/a",
         "latency_ms": 0,
         "estimated_cost": 0,
+        "issue_text_source": issue_text_source,
+        "issue_text_len": len(issue_text),
     }
     if args.mode == "github":
         from . import github_bot
@@ -699,10 +864,17 @@ def main():
                 plan_body = (
                     "## Proposed Plan (PENDING APPROVAL)\n\n"
                     + answer_data["answer"]
-                    + "\n\n### Proposed actions (struct)\n```json\n"
+                    + "\n\n### Intermediate (evidence summary)\n```json\n"
+                    + json.dumps(answer_data.get("intermediate", {}), indent=2)
+                    + "\n```\n"
+                    + "\n### Intermediate meta\n```json\n"
+                    + json.dumps(answer_data.get("intermediate_meta", {}), indent=2)
+                    + "\n```\n"
+                    + "\n### Proposed actions (struct)\n```json\n"
                     + json.dumps(proposed_actions_struct, indent=2)
                     + "\n```"
                 )
+
                 github_bot.post_comment(args.repo, args.issue_number, plan_body)
 
                 labels = list(proposed_actions_struct.get("labels_to_add") or [])
