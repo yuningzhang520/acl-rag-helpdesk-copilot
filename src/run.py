@@ -907,6 +907,11 @@ def main():
     parser.add_argument("--repo", help="GitHub repo owner/name (required for --mode github)")
     parser.add_argument("--issue_number", type=int, help="GitHub issue number (required for --mode github)")
     parser.add_argument("--github_stage", choices=["propose", "execute"], default="propose", help="GitHub mode: propose = post plan only; execute = check approval and run allowlisted actions (default: propose)")
+    parser.add_argument("--retriever", choices=["keyword", "vector", "hybrid"], default="keyword", help="Retrieval method: keyword (default), vector, or hybrid (vector + keyword rerank)")
+    parser.add_argument("--candidate_k", type=int, default=30, help="Candidate pool size for vector/hybrid (default: 30)")
+    parser.add_argument("--rebuild_index", action="store_true", help="Force rebuild of vector index (workflows/vector_*.npz and .json)")
+    parser.add_argument("--hybrid_alpha", type=float, default=0.7, help="Hybrid retriever: final_score = alpha*kw_norm + (1-alpha)*vector_score; kw_norm in [0,1] (default: 0.7)")
+    parser.add_argument("--no_troubleshoot_bias", action="store_true", help="Disable troubleshooting intent bias in retrieval (bias ON by default: boosts verify/troubleshoot sections when query suggests trouble)")
     args = parser.parse_args()
     import time as _time
     _start_audit = _time.perf_counter()
@@ -1001,9 +1006,25 @@ def main():
     # Load allowed documents
     docs_root = repo_root / "docs"
     all_sections = load_allowed_documents(allowed_tiers, docs_root)
-    
-    # Retrieve top_k sections
-    retrieved = retrieve_top_k(all_sections, issue_text, args.top_k)
+
+    # Retrieve: keyword (default) or vector/hybrid via retrieval.retrieve
+    from . import retrieval as retrieval_mod
+    index_bundle = None
+    if args.retriever in ("vector", "hybrid"):
+        cache_dir = repo_root / "workflows"
+        index_bundle = retrieval_mod.build_or_load_vector_index(
+            all_sections, cache_dir, rebuild=args.rebuild_index
+        )
+    retrieved, retriever_debug = retrieval_mod.retrieve(
+        issue_text,
+        all_sections,
+        top_k=args.top_k,
+        retriever_type=args.retriever,
+        candidate_k=args.candidate_k,
+        index_bundle=index_bundle,
+        hybrid_alpha=args.hybrid_alpha,
+        troubleshoot_bias=not args.no_troubleshoot_bias,
+    )
     _, source_map = build_source_catalog(retrieved)
     
     # Build citations from retrieved sections (single source of truth)
@@ -1026,8 +1047,8 @@ def main():
 
     # Retrieval confidence for output: prefer intermediate-derived if present, else deterministic helper
     # If you kept det helper _retrieval_confidence_num, it was stripped before returning.
-    # So we compute from retrieval score again:
-    max_score = max((s.get("score", 0) for s in retrieved), default=0)
+    # Use final_score when present (hybrid/vector/keyword all set it) so confidence reflects ranking score
+    max_score = max((s.get("final_score", s.get("score", 0)) for s in retrieved), default=0)
     retrieval_conf = confidence_from_max_score(max_score, k=12.0)
     if max_score == 0:
         retrieval_conf = 0.25
@@ -1065,11 +1086,19 @@ def main():
         proposal=proposal,
     )
 
-    # Build base output (triage_method=keyword, retrieval_confidence)
-    debug_retrieved = [
-        {"doc": s["doc_path"], "section": s["heading"], "tier": s["tier"], "score": s["score"]}
-        for s in retrieved
-    ]
+    # Build base output (triage_method=keyword, retrieval_confidence); scoring fields explicit for debug
+    debug_retrieved = []
+    for s in retrieved:
+        entry = {"doc": s["doc_path"], "section": s["heading"], "tier": s["tier"], "score": s["score"]}
+        if "final_score" in s:
+            entry["final_score"] = s["final_score"]
+        if "keyword_score" in s:
+            entry["keyword_score"] = s["keyword_score"]
+        if "keyword_norm" in s:
+            entry["keyword_norm"] = s["keyword_norm"]
+        if "vector_score" in s:
+            entry["vector_score"] = s["vector_score"]
+        debug_retrieved.append(entry)
     output = {
         "answer": answer_data["answer"],
         "citations": answer_data["citations"],
@@ -1091,6 +1120,12 @@ def main():
             "issue_text_preview_raw": issue_text_raw[:200],
             "retrieved": debug_retrieved,
             "llm_propose": bool(args.llm_propose),
+            "retriever_type": retriever_debug.get("retriever_type", "keyword"),
+            "candidate_k": retriever_debug.get("candidate_k"),
+            "vector_index_info": retriever_debug.get("vector_index_info"),
+            "hybrid_alpha": retriever_debug.get("hybrid_alpha"),
+            "troubleshoot_bias": retriever_debug.get("troubleshoot_bias"),
+            "troubleshoot_intent_detected": retriever_debug.get("troubleshoot_intent_detected"),
         },
     }
 
@@ -1121,6 +1156,9 @@ def main():
         "llm_propose": bool(args.llm_propose),
         "proposal_meta": proposal_meta if args.llm_propose else {},
         "issue_text_len_raw": len(issue_text_raw),
+        "retriever_type": retriever_debug.get("retriever_type", "keyword"),
+        "candidate_k": retriever_debug.get("candidate_k"),
+        "vector_model_name": (retriever_debug.get("vector_index_info") or {}).get("model_name") or "",
     }
     if args.mode == "github":
         from . import github_bot
