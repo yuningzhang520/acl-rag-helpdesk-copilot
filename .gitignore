@@ -22,11 +22,17 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
-workflows/audit_log.jsonl
 
 # generated
 .eval_results.csv
 eval_results.csv
-workflows/audit_log.jsonl
 __pycache__/
 *.pyc
+
+# workflows: vector index artifacts (built on first vector/hybrid run)
+workflows/vector_index__*.npz
+workflows/vector_meta__*.json
+workflows/vector_info__*.json
+# audit and backup logs
+workflows/audit_log.jsonl
+workflows/*.backup.jsonl
