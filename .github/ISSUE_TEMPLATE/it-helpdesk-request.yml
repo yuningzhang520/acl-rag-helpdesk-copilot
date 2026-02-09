@@ -3,11 +3,16 @@ description: Submit an internal IT helpdesk request (VPN, MFA, access, onboardin
 title: "[IT] "
 labels: ["intake"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        **Note:** Do not include passwords, MFA codes, or secrets. Requester role/tier is enforced via directory mapping.
+
   - type: dropdown
     id: request_type
     attributes:
       label: Request Type
-      description: Select the type of IT request
+      description: Type of IT request
       options:
         - VPN
         - MFA
@@ -31,16 +36,69 @@ body:
       required: true
 
   - type: dropdown
-    id: user_role
+    id: impact_scope
     attributes:
-      label: User Role
-      description: Role of the user making the request (self-declared; enforcement can use directory mapping)
+      label: Impact scope
+      description: Who is affected?
       options:
-        - Employee
-        - Engineer
-        - IT Admin
+        - Only me
+        - My team
+        - Many users
     validations:
       required: true
+
+  - type: input
+    id: system_app
+    attributes:
+      label: System / App
+      description: System or application involved
+      placeholder: e.g. VPN client, Okta, Shared Drive, HR portal
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Description
+      description: What do you need help with?
+      placeholder: |
+        - What happened?
+        - What do you need?
+        - Context (team, project, recent changes)
+    validations:
+      required: true
+
+  - type: input
+    id: exact_error
+    attributes:
+      label: Exact error message
+      description: Paste the exact error message if any (optional)
+      placeholder: e.g. "Access denied" or "Connection timeout"
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps_tried
+    attributes:
+      label: Steps already tried
+      description: What have you already tried? (optional)
+      placeholder: e.g. Restarted client, cleared cache, checked firewall
+    validations:
+      required: false
+
+  - type: textarea
+    id: access_request_details
+    attributes:
+      label: Access request details
+      description: Required if Request Type = Access. For access requests only — resource type, path/name, access level, business justification, duration (optional).
+      placeholder: |
+        Resource type: (e.g. Google Drive Shared Drive / Okta / VPN (AnyConnect) / Slack / Jira / GitHub, app group)
+        Resource path/name:
+        Access level needed: (read / write / admin)
+        Business justification:
+        Duration: (permanent / time-bounded — optional)
+    validations:
+      required: false
 
   - type: dropdown
     id: environment
@@ -58,34 +116,11 @@ body:
     validations:
       required: false
 
-  - type: checkboxes
-    id: sensitivity
-    attributes:
-      label: Sensitivity / Access
-      description: Helps route and apply approval gates.
-      options:
-        - label: This request involves access/permissions or sensitive data.
-    validations:
-      required: false
-
-  - type: textarea
-    id: details
-    attributes:
-      label: Description
-      description: Provide details (context, error messages, steps tried).
-      placeholder: |
-        - What do you need help with?
-        - What have you already tried?
-        - Any error messages?
-        - Screenshots/links (optional)
-    validations:
-      required: true
-
   - type: input
     id: incident_timestamp
     attributes:
       label: Incident/Request Timestamp
-      description: When did this occur? (YYYY-MM-DD HH:MM). Leave blank if unknown.
+      description: When did this occur? (YYYY-MM-DD HH:MM). Optional.
       placeholder: "2026-01-27 14:30"
     validations:
       required: false
@@ -93,8 +128,8 @@ body:
   - type: input
     id: target_resolution_date
     attributes:
-      label: Target Resolution Date (Optional)
-      description: When does this need to be resolved by? (YYYY-MM-DD)
+      label: Needed by / Target Resolution Date
+      description: When does this need to be resolved by? (YYYY-MM-DD). Optional.
       placeholder: "2026-01-30"
     validations:
       required: false

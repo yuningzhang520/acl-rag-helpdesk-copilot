@@ -32,6 +32,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from typing import Any
+from typing import Optional
 
 # Role → allowed permission tiers mapping
 ROLE_TIER_MAP = {
@@ -302,39 +303,79 @@ def triage_issue(issue_text: str) -> Dict[str, str]:
 def normalize_issue_text(issue_text: str, source: str) -> str:
     """
     Reduce noise from GitHub issue templates.
-    Keep title + key sections only to improve retrieval quality.
+    Keep title + retrieval-useful sections only.
+    Drop routing/metadata fields (request type, urgency, timestamps, etc.).
+    Supports both "### Heading" and plain-label patterns.
     """
     if source != "github_issue":
         return issue_text.strip()
 
     t = issue_text.strip()
+    lines = t.splitlines()
 
-    # Keep only common template parts (light heuristic)
+    KEEP_HEADERS = {
+        "description",
+        "system / app",
+        "system/app",
+        "exact error message",
+        "error",
+        "steps already tried",
+        "steps tried",
+        "steps to reproduce",
+        "access request details",
+        "impact scope",
+        "environment",
+    }
+    DROP_HEADERS = {
+        "request type",
+        "urgency",
+        "user role",
+        "sensitivity",
+        "incident/request timestamp",
+        "incident/request time",
+        "needed by / target resolution date",
+        "needed by",
+        "target resolution date",
+        "labels",
+    }
+
+    def normalize_header(s: str) -> str:
+        s = s.strip().lower()
+        # remove trailing ":" if present
+        s = re.sub(r":\s*$", "", s)
+        return s
+
+    def parse_header(line: str):
+        s = line.strip()
+        if not s:
+            return None
+        m = re.match(r"^###\s*(.+?)\s*$", s)
+        if m:
+            return normalize_header(m.group(1))
+        # plain label line
+        return normalize_header(s) if normalize_header(s) in (KEEP_HEADERS | DROP_HEADERS) else None
+
     keep_lines = []
     keep = False
-    for line in t.splitlines():
-        l = line.strip()
 
-        # Always keep title line(s)
-        if l and not keep_lines:
-            keep_lines.append(l)
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not keep_lines:
+            # first non-empty line = title
+            keep_lines.append(stripped)
             continue
 
-        # Turn on keeping after these headers (adjust to your template)
-        if re.match(r"^###\s*(Description|Error|Impact|Steps tried|Steps to Reproduce|Environment)\b", l, flags=re.I):
-            keep = True
-            keep_lines.append(l)
+        h = parse_header(line)
+        if h is not None:
+            if h in KEEP_HEADERS:
+                keep = True
+                keep_lines.append(stripped)
+            else:
+                keep = False
             continue
 
-        # Turn off keeping after unrelated headers
-        if re.match(r"^###\s*(Request Type|Urgency|User Role|Sensitivity|Incident/Request Timestamp|Target Resolution Date)\b", l, flags=re.I):
-            keep = False
-            continue
-
-        if keep:
-            # skip empty boilerplate checkbox line etc.
-            if l and l != "- [ ]":
-                keep_lines.append(l)
+        if keep and stripped and stripped != "- [ ]":
+            keep_lines.append(stripped)
 
     out = "\n".join(keep_lines).strip()
     return out if out else issue_text.strip()
@@ -896,6 +937,7 @@ def answer_from_intermediate(intermediate: Dict[str, Any], source_map: Optional[
     return "\n".join(answer_lines), proposed_actions
 
 def main():
+    # create input parameters/format, required means must, help is just a description for error output
     parser = argparse.ArgumentParser(description="MVP Retrieval + Citations + ACL Pipeline")
     parser.add_argument("--user_id", required=True, help="User ID from directory.csv")
     parser.add_argument("--issue", help="Issue/question text (optional in --mode github; will read from GitHub issue if omitted)")
@@ -916,6 +958,7 @@ def main():
     import time as _time
     _start_audit = _time.perf_counter()
 
+    # if mode is github, repo and issue_number are required to get issue text
     if args.mode == "github" and (not args.repo or args.issue_number is None):
         error_output = {
             "answer": "Error: --repo and --issue_number are required when --mode github",
@@ -928,7 +971,7 @@ def main():
         print(json.dumps(error_output, indent=2))
         sys.exit(1)
     
-    # Determine issue_text
+    # Determine issue_text, if provide as '-- issue' use it and mark cli, otherwise remain empty, may pull from github later
     issue_text = (args.issue or "").strip()
     issue_text_source = "cli_arg" if issue_text else ""
 
