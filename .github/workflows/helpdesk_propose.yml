@@ -4,6 +4,11 @@ name: Helpdesk Propose
 on:
   issues:
     types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   propose:
     runs-on: ubuntu-latest
