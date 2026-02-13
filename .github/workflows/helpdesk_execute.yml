@@ -1,0 +1,32 @@
+# Runs only when a user comments "APPROVE" on an issue (not on PRs). run.py finds latest Proposed Plan and validates approver.
+# OPENAI not required for execute (no LLM calls).
+name: Helpdesk Execute
+on:
+  issue_comment:
+    types: [created]
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    if: github.event.issue.pull_request == null
+    steps:
+      - name: Only run on APPROVE comment
+        run: |
+          body="${{ github.event.comment.body }}"
+          body_trimmed=$(echo "$body" | tr -d '\n\r' | xargs)
+          if [ "$(echo "$body_trimmed" | tr '[:upper:]' '[:lower:]')" != "approve" ]; then
+            echo "Skipping: comment body is not APPROVE"
+            exit 78
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e .
+      - name: Run execute
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -m src.run --mode github --github_stage execute \
+            --repo "${{ github.repository }}" \
+            --issue_number "${{ github.event.issue.number }}"

@@ -24,15 +24,15 @@ import argparse
 import csv
 import json
 import os
-import urllib.request
-import urllib.error
 import re
 import sys
-from collections import Counter
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from typing import Any
-from typing import Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Retrieval confidence smoothing (single source of truth for confidence_from_max_score)
+CONF_K = 8.0
 
 # Role → allowed permission tiers mapping
 ROLE_TIER_MAP = {
@@ -103,7 +103,7 @@ def load_directory(csv_path: str) -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
     return directory, by_github
 
 
-def resolve_user(user_id: str, directory: Dict, role_override: Optional[str] = None) -> Dict:
+def resolve_user(user_id: str, directory: Dict, role_override: Optional[str] = None) -> Optional[Dict]:
     """Resolve user_id to role and allowed tiers."""
     if user_id in directory:
         return directory[user_id]
@@ -192,14 +192,6 @@ def load_allowed_documents(allowed_tiers: List[str], docs_root: Path) -> List[Di
     return all_sections
 
 
-def tokenize(text: str) -> List[str]:
-    """Simple tokenization: lowercase, split on whitespace and punctuation."""
-    # Remove markdown formatting
-    text = re.sub(r"[*_`#\[\]()]", " ", text)
-    # Split and lowercase
-    tokens = re.findall(r"\b\w+\b", text.lower())
-    return tokens
-
 def slugify_heading(text: str) -> str:
     """Create a stable markdown-style anchor slug from a heading."""
     s = text.strip().lower()
@@ -208,7 +200,7 @@ def slugify_heading(text: str) -> str:
     s = re.sub(r"-{2,}", "-", s).strip("-")
     return s
 
-def confidence_from_max_score(max_score: float, k: float = 12.0) -> float:
+def confidence_from_max_score(max_score: float, k: float = CONF_K) -> float:
     """
     Map retrieval score to [0,1) with a simple saturating function:
     conf = max_score / (max_score + k)
@@ -219,93 +211,42 @@ def confidence_from_max_score(max_score: float, k: float = 12.0) -> float:
         return 0.0
     return float(max_score / (max_score + k))
 
-def score_section(section: Dict, issue_tokens: List[str]) -> float:
-    """Score section vs issue using TF overlap + heading/filename bonus."""
-    issue_counter = Counter(issue_tokens)
-
-    body_tokens = tokenize(section.get("content", ""))
-    head_tokens = tokenize(section.get("heading", "") + " " + Path(section.get("doc_path", "")).name)
-
-    body_c = Counter(body_tokens)
-    head_c = Counter(head_tokens)
-
-    # Base score:content term-frequency overlap（logic from original code）
-    score = 0.0
-    for t, w in issue_counter.items():
-        score += w * body_c.get(t, 0)
-
-    # Bonus: title/filename hit weighting (small bonus, not replacing content)
-    # Key: use min(1, head_c[t]) to prevent score from being inflated by repeated words in title
-    HEAD_WEIGHT = 2.0  # 1.5~3.0 is fine; use 2.0 for now
-    for t, w in issue_counter.items():
-        if head_c.get(t, 0) > 0:
-            score += HEAD_WEIGHT * w * 1.0
-
-    return score
-
-def retrieve_top_k(sections: List[Dict], issue_text: str, top_k: int) -> List[Dict]:
-    """Retrieve top_k sections based on keyword scoring."""
-    issue_tokens = tokenize(issue_text)
-    
-    # Score all sections
-    scored_sections = []
-    for section in sections:
-        score = score_section(section, issue_tokens)
-        scored_sections.append({
-            **section,
-            "score": score,
-        })
-    
-    # Sort by score descending
-    scored_sections.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Return top_k
-    top_sections = scored_sections[:top_k]
-    
-    # If all scores are zero, use fallback (first sections by doc order)
-    if all(s["score"] == 0 for s in top_sections) and len(scored_sections) > top_k:
-        # Fallback: return first sections from different docs
-        seen_docs = set()
-        fallback = []
-        for s in scored_sections:
-            if len(fallback) >= top_k:
-                break
-            doc = s["doc_path"]
-            if doc not in seen_docs:
-                fallback.append(s)
-                seen_docs.add(doc)
-        if fallback:
-            top_sections = fallback
-    
-    return top_sections
-
-
-def triage_issue(issue_text: str) -> Dict[str, str]:
-    """Simple deterministic triage based on keywords."""
+def triage_issue(issue_text: str, source: str = "cli_arg") -> Dict[str, str]:
+    """Simple deterministic triage based on keywords. For github_issue, priority can come from explicit Urgency section."""
     issue_lower = issue_text.lower()
-    
+
     # Determine category
     category = "Other"
     for cat, keywords in CATEGORY_KEYWORDS.items():
         if any(kw in issue_lower for kw in keywords):
             category = cat
             break
-    
-    # Determine priority
+
+    # Priority: for GitHub Issue Form, check explicit ### Urgency section first
     priority = "Low"
-    for prio, keywords in PRIORITY_KEYWORDS.items():
-        if any(kw in issue_lower for kw in keywords):
-            priority = prio
-            break
-    
+    if source == "github_issue":
+        urgency_heading = re.search(r"###\s*urgency\s*:?\s*\n", issue_text, re.IGNORECASE)
+        if urgency_heading:
+            after = issue_text[urgency_heading.end():].split("\n")
+            for line in after[:5]:
+                val = line.strip().strip("- []").strip().lower()
+                if val in ("critical", "high", "medium", "low"):
+                    priority = val.capitalize()
+                    break
+    if priority == "Low":
+        for prio, keywords in PRIORITY_KEYWORDS.items():
+            if any(kw in issue_lower for kw in keywords):
+                priority = prio
+                break
+
     return {"category": category, "priority": priority}
 
 def normalize_issue_text(issue_text: str, source: str) -> str:
     """
-    Reduce noise from GitHub issue templates.
-    Keep title + retrieval-useful sections only.
-    Drop routing/metadata fields (request type, urgency, timestamps, etc.).
-    Supports both "### Heading" and plain-label patterns.
+    For github_issue only: keep title + sections under GitHub Issue Form markdown headings.
+    Keeps retrieval-useful sections and Urgency (for triage alignment). Drops Request Type,
+    Incident/Request Timestamp, Needed by / Target Resolution Date.
+    Non-github sources: return issue_text.strip() unchanged.
     """
     if source != "github_issue":
         return issue_text.strip()
@@ -313,47 +254,26 @@ def normalize_issue_text(issue_text: str, source: str) -> str:
     t = issue_text.strip()
     lines = t.splitlines()
 
+    # Exact Issue Form labels (case-insensitive); only these headings are recognized.
     KEEP_HEADERS = {
         "description",
         "system / app",
-        "system/app",
-        "exact error message",
-        "error",
-        "steps already tried",
-        "steps tried",
-        "steps to reproduce",
-        "access request details",
         "impact scope",
+        "exact error message",
+        "steps already tried",
+        "access request details",
         "environment",
+        "urgency",
     }
     DROP_HEADERS = {
         "request type",
-        "urgency",
-        "user role",
-        "sensitivity",
         "incident/request timestamp",
-        "incident/request time",
         "needed by / target resolution date",
-        "needed by",
-        "target resolution date",
         "labels",
     }
 
-    def normalize_header(s: str) -> str:
-        s = s.strip().lower()
-        # remove trailing ":" if present
-        s = re.sub(r":\s*$", "", s)
-        return s
-
-    def parse_header(line: str):
-        s = line.strip()
-        if not s:
-            return None
-        m = re.match(r"^###\s*(.+?)\s*$", s)
-        if m:
-            return normalize_header(m.group(1))
-        # plain label line
-        return normalize_header(s) if normalize_header(s) in (KEEP_HEADERS | DROP_HEADERS) else None
+    def normalized_heading(s: str) -> str:
+        return s.strip().lower().rstrip(":").strip()
 
     keep_lines = []
     keep = False
@@ -361,20 +281,22 @@ def normalize_issue_text(issue_text: str, source: str) -> str:
     for line in lines:
         stripped = line.strip()
         if stripped and not keep_lines:
-            # first non-empty line = title
             keep_lines.append(stripped)
             continue
 
-        h = parse_header(line)
-        if h is not None:
+        m = re.match(r"^###\s*(.+)$", stripped)
+        if m:
+            h = normalized_heading(m.group(1))
             if h in KEEP_HEADERS:
                 keep = True
                 keep_lines.append(stripped)
+            elif h in DROP_HEADERS:
+                keep = False
             else:
                 keep = False
             continue
 
-        if keep and stripped and stripped != "- [ ]":
+        if keep and stripped and stripped != "- [ ]" and stripped.lower() != "_no response_":
             keep_lines.append(stripped)
 
     out = "\n".join(keep_lines).strip()
@@ -383,20 +305,21 @@ def normalize_issue_text(issue_text: str, source: str) -> str:
 def build_proposed_actions_struct(
     triage: Dict[str, str],
     proposed_actions: List[str],
-    mode: str,
 ) -> Dict:
     category = triage.get("category", "Other")
     priority = triage.get("priority", "Low")
 
-    # ✅ Only Access requires approval (L2). Everything else is triaged without approval.
+    # L2 only for Access (minimal scope). Everything else is L1 (auto-execute).
     if category == "Access":
         risk_level = "L2"
-        approval_role = "IT Admin"
+        approval_role_required = "IT Admin"
         needs_approval = True
+        auto_execute = False
     else:
         risk_level = "L1"
-        approval_role = "Engineer"
+        approval_role_required = "N/A"  # not applicable; L1 auto-executes (stable string for parseability)
         needs_approval = False
+        auto_execute = True
 
     status = "status:pending-approval" if needs_approval else "status:triaged"
     labels_to_add = [f"cat:{category}", f"prio:{priority}", status]
@@ -407,38 +330,76 @@ def build_proposed_actions_struct(
     return {
         "risk_level": risk_level,
         "needs_approval": needs_approval,
-        "approval_role": approval_role,
+        "approval_role_required": approval_role_required,
+        "auto_execute": auto_execute,
         "labels_to_add": labels_to_add,
         "assignees": assignees,
         "comment_summary": comment_summary,
     }
 
 def _parse_proposed_plan_struct_from_comment(body: str) -> Optional[Dict]:
-    """Extract proposed_actions_struct from a Proposed Plan comment body (```json ... ```)."""
+    """
+    Extract proposed_actions_struct from the fenced code block under
+    '### Proposed actions (struct)' in a Proposed Plan comment.
+    Accepts ```json, ```JSON, or plain ```; heading may have optional colon.
+    Returns None if not found, parse fails, or required keys missing.
+    """
     if not body:
         return None
-    match = re.search(r"```json\s*([\s\S]*?)```", body)
+    # Locate heading (optional colon, flexible whitespace)
+    heading_re = re.compile(
+        r"###\s*Proposed\s+actions\s+\(struct\)\s*:?\s*",
+        re.IGNORECASE,
+    )
+    match = heading_re.search(body)
     if not match:
         return None
+    after_heading = body[match.end() :]
+    # Find next fenced code block (```json, ```JSON, or ```)
+    fence_re = re.compile(r"```\s*(?:json|JSON)?\s*\n([\s\S]*?)```", re.IGNORECASE)
+    block = fence_re.search(after_heading)
+    if not block:
+        return None
+    raw = block.group(1).strip()
     try:
-        return json.loads(match.group(1).strip())
+        parsed = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
+    if not isinstance(parsed, dict):
+        return None
+    required = ("risk_level", "needs_approval", "approval_role_required", "labels_to_add")
+    if any(k not in parsed for k in required):
+        return None
+    # Normalize: approval_role_required must be string "IT Admin" (L2) or "N/A" (L1)
+    role_req = parsed.get("approval_role_required")
+    if not isinstance(role_req, str) or role_req not in ("IT Admin", "N/A"):
+        return None
+    # labels_to_add must be non-empty list of strings
+    labels = parsed.get("labels_to_add")
+    if not isinstance(labels, list) or not labels or not all(isinstance(x, str) for x in labels):
+        return None
+    return parsed
+
+
+def _plan_title(needs_approval: bool) -> str:
+    """Title for the propose-stage GitHub comment: PENDING APPROVAL (L2) or TRIAGED (L1)."""
+    return "Proposed Plan (PENDING APPROVAL)" if needs_approval else "Proposed Plan (TRIAGED)"
 
 
 def _find_latest_proposed_plan_and_approve(
     comments: List[Dict],
 ) -> Tuple[Optional[Dict], Optional[Dict], Optional[Dict]]:
     """
-    Find the most recent comment containing 'Proposed Plan (PENDING APPROVAL)',
+    Find the most recent comment containing a plan title (Proposed Plan (PENDING APPROVAL) or Proposed Plan (TRIAGED)),
     then the latest APPROVE comment posted *after* it.
-    comments are assumed in ascending order (oldest first).
+    Relies on github_bot.list_comments() returning comments in ascending order by creation time.
     Returns (plan_comment, parsed_struct, approve_comment_after_plan).
     """
     plan_comment = None
     plan_index = -1
     for i in range(len(comments) - 1, -1, -1):
-        if "Proposed Plan (PENDING APPROVAL)" in (comments[i].get("body") or ""):
+        body = comments[i].get("body") or ""
+        if "Proposed Plan (PENDING APPROVAL)" in body or "Proposed Plan (TRIAGED)" in body:
             plan_comment = comments[i]
             plan_index = i
             break
@@ -460,7 +421,7 @@ def _find_latest_proposed_plan_and_approve(
 def build_source_catalog(context_sections: List[Dict]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, str]]]:
     """
     sources: list for LLM prompt
-    source_map: source_id -> {doc_name, anchor, heading}
+    source_map: source_id -> {doc_name, anchor, heading, tier}
     """
     sources: List[Dict[str, Any]] = []
     source_map: Dict[str, Dict[str, str]] = {}
@@ -470,6 +431,7 @@ def build_source_catalog(context_sections: List[Dict]) -> Tuple[List[Dict[str, A
         doc_name = Path(s["doc_path"]).name
         anchor = s.get("anchor", "")
         heading = s.get("heading", "")
+        tier = s.get("tier", "")
         sources.append({
             "source_id": source_id,
             "doc_name": doc_name,
@@ -477,7 +439,7 @@ def build_source_catalog(context_sections: List[Dict]) -> Tuple[List[Dict[str, A
             "heading": heading,
             "content": (s.get("content") or "").strip(),
         })
-        source_map[source_id] = {"doc_name": doc_name, "anchor": anchor, "heading": heading}
+        source_map[source_id] = {"doc_name": doc_name, "anchor": anchor, "heading": heading, "tier": tier}
 
     return sources, source_map
 
@@ -532,20 +494,94 @@ def _pick_best_line(text: str) -> str:
 
     return ""
 
+def _extract_rationale(text: str) -> str:
+    """Derive a short rationale from evidence text without introducing new facts. Max 120 chars."""
+    t = (text or "").strip()
+    if not t:
+        return "Recommended by the cited runbook for this symptom."
+    lower = t.lower()
+    markers = ("because", "so that", "indicating", "likely", " may ", " can ", "helps")
+    for m in markers:
+        idx = lower.find(m)
+        if idx >= 0:
+            tail = t[idx:].strip()
+            if tail.lower().startswith(("to the ", "to a ", "to be ")):
+                break
+            if len(tail) > 120:
+                tail = tail[:117].rstrip() + "..."
+            return tail if tail else "Recommended by the cited runbook for this symptom."
+    return "Recommended by the cited runbook for this symptom."[:120]
+
+
+def _strip_leading_filler(text: str) -> str:
+    """Remove common filler prefixes (case-insensitive), then trim."""
+    t = (text or "").strip()
+    fillers = (
+        "resolution includes",
+        "likely causes include",
+        "user may experience",
+        "steps include",
+        "this may be due to",
+    )
+    for f in fillers:
+        if t.lower().startswith(f):
+            t = t[len(f):].strip()
+            break
+    return t.strip()
+
+
+def _normalize_action_text(text: str) -> str:
+    """Lowercase, strip punctuation, collapse spaces for grouping."""
+    t = (text or "").lower().strip()
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def _leading_verb_key(text: str) -> str:
+    """Return leading verb for grouping (or 'other'). Uses filler stripping; verb may be in first ~8 words."""
+    t = _strip_leading_filler(text)
+    t = _normalize_action_text(t)
+    for prefix in ("the ", "a ", "an "):
+        if t.startswith(prefix):
+            t = t[len(prefix):].strip()
+            break
+    verbs = ("confirm", "ensure", "check", "retry", "restart", "open", "disconnect", "reconnect", "verify", "sign in", "sign-in")
+    for v in verbs:
+        if t.startswith(v):
+            return v
+    words = t.split()[:8]
+    for v in verbs:
+        if v in ("sign in", "sign-in"):
+            if "sign" in words and "in" in words:
+                i = words.index("sign")
+                if i + 1 < len(words) and words[i + 1] == "in":
+                    return "sign in"
+        elif v in words:
+            return v
+    return "other"
+
+
+# give a schema/structure for the intermediate output (v2: summary_steps + evidence_bullets)
 def _deterministic_intermediate(context_sections: List[Dict], issue_text: str) -> Dict[str, Any]:
     if not context_sections:
         return {
-            "bullets": [
+            "summary_steps": [
+                {"step": "Escalate through official IT support.", "rationale": "No runbook sections were retrieved.", "source_ids": []},
+                {"step": "Provide more details or error message.", "rationale": "Helps narrow down the right runbook.", "source_ids": []},
+            ],
+            "evidence_bullets": [
                 {"text": "No accessible runbook sections were retrieved for this request.", "source_id": "N/A"},
                 {"text": "Escalate through the official IT support process or provide more details.", "source_id": "N/A"},
             ],
             "clarifying_question": "What system/app and exact error message are you seeing?",
             "confidence_level": "Low",
             "confidence_reason": "No retrieved evidence available in accessible tiers.",
+            "_retrieval_confidence_num": 0.25,
         }
 
-    max_score = max((s.get("score", 0) for s in context_sections), default=0)
-    conf_num = confidence_from_max_score(max_score, k=12.0)
+    max_score = max((s.get("final_score", s.get("score", 0)) for s in context_sections), default=0)
+    conf_num = confidence_from_max_score(max_score)
     if max_score == 0:
         conf_num = 0.25
 
@@ -558,63 +594,126 @@ def _deterministic_intermediate(context_sections: List[Dict], issue_text: str) -
 
     sources, _ = build_source_catalog(context_sections)
 
-    bullets: List[Dict[str, str]] = []
-    for src in sources[:5]:
+    # evidence_bullets: best lines from top sources (source-grounded, no merging)
+    evidence_bullets: List[Dict[str, str]] = []
+    for src in sources[:8]:
         best = _pick_best_line(src.get("content", ""))
         if not best:
-            # fallback if content is empty
             best = f'{src["doc_name"]} — {src["heading"]}'
         if len(best) > 160:
             best = best[:160].rstrip() + "..."
-        bullets.append({
-            "text": best,
-            "source_id": src["source_id"],
-        })
+        evidence_bullets.append({"text": best, "source_id": src["source_id"]})
 
-    while len(bullets) < 2:
-        bullets.append({"text": "Review the retrieved runbook sections and follow the documented steps.", "source_id": "N/A"})
+    while len(evidence_bullets) < 2:
+        evidence_bullets.append({"text": "Review the retrieved runbook sections and follow the documented steps.", "source_id": "N/A"})
+
+    # summary_steps: group by leading verb, dedupe; step + rationale (<=120) from evidence; source_ids from contributors
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for b in evidence_bullets[:8]:
+        text = (b.get("text") or "").strip()
+        sid = (b.get("source_id") or "").strip()
+        if not text or sid == "N/A":
+            continue
+        key = _leading_verb_key(text)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append({"text": text, "source_id": sid})
+
+    summary_steps: List[Dict[str, Any]] = []
+    for key in ("verify", "check", "confirm", "ensure", "retry", "restart", "reconnect", "disconnect", "open", "sign in", "sign-in", "other"):
+        if key not in groups or not groups[key]:
+            continue
+        items = groups[key]
+        raw_text = items[0]["text"]
+        step = raw_text[:80].rstrip()
+        if len(raw_text) > 80:
+            step = step + "..."
+        rationale = _extract_rationale(raw_text)
+        source_ids = list(dict.fromkeys([x["source_id"] for x in items]))
+        summary_steps.append({"step": step, "rationale": rationale, "source_ids": source_ids})
+        if len(summary_steps) >= 5:
+            break
+
+    fallback_sids = [b["source_id"] for b in evidence_bullets if (b.get("source_id") or "").strip() != "N/A"][:3]
+    while len(summary_steps) < 2:
+        summary_steps.append({
+            "step": "Follow the cited runbook steps.",
+            "rationale": "Evidence from retrieved sections.",
+            "source_ids": fallback_sids if fallback_sids else [sources[0]["source_id"]] if sources else [],
+        })
 
     issue_lower = issue_text.lower()
     needs_details = any(k in issue_lower for k in ["cannot", "can't", "unable", "not working", "doesn't work", "error"])
-
-    # If issue already includes an explicit error line, don't ask for it again
     has_explicit_error = ("error:" in issue_lower) or ("authentication failed" in issue_lower) or ('stuck at "connecting"' in issue_lower) or ("stuck at 'connecting'" in issue_lower)
-
     clarifying = ""
     if needs_details and not has_explicit_error:
         clarifying = "Which system/app is this for, and what is the exact error message (copy/paste if possible)?"
 
     return {
-        "bullets": bullets[:5],
+        "summary_steps": summary_steps[:5],
+        "evidence_bullets": evidence_bullets[:8],
         "clarifying_question": clarifying,
         "confidence_level": conf_level,
         "confidence_reason": f"Derived from retrieval max_score={max_score} (confidence={conf_num:.2f}).",
         "_retrieval_confidence_num": conf_num,
     }
 
-def _validate_intermediate(obj: Any, source_map: Dict[str, Dict[str, str]]) -> Tuple[bool, str]:
+# V2 intermediate schema: summary_steps + evidence_bullets (citations from evidence_bullets only)
+def _validate_intermediate_v2(obj: Any, source_map: Dict[str, Dict[str, str]]) -> Tuple[bool, str]:
     if not isinstance(obj, dict):
         return False, "not_a_dict"
 
-    for k in ["bullets", "clarifying_question", "confidence_level", "confidence_reason"]:
+    for k in ["summary_steps", "evidence_bullets", "clarifying_question", "confidence_level", "confidence_reason"]:
         if k not in obj:
             return False, f"missing_field:{k}"
 
-    bullets = obj.get("bullets")
-    if not isinstance(bullets, list) or not (2 <= len(bullets) <= 5):
-        return False, "bullets_count_out_of_range"
-
-    for b in bullets:
+    # evidence_bullets: 2-8 items; each non-empty text and valid source_id (or N/A only if no sources)
+    eb = obj.get("evidence_bullets")
+    if not isinstance(eb, list) or not (2 <= len(eb) <= 8):
+        return False, "evidence_bullets_count_out_of_range"
+    has_sources = len(source_map) > 0
+    for b in eb:
         if not isinstance(b, dict):
-            return False, "bullet_not_object"
+            return False, "evidence_bullet_not_object"
         text = b.get("text")
-        sid = b.get("source_id")
+        sid = (b.get("source_id") or "").strip()
         if not isinstance(text, str) or not text.strip():
-            return False, "bullet_text_invalid"
-        if not isinstance(sid, str) or not sid.strip():
-            return False, "bullet_source_id_invalid"
-        if sid != "N/A" and sid not in source_map:
-            return False, "bullet_source_id_not_in_sources"
+            return False, "evidence_bullet_text_invalid"
+        if not sid:
+            return False, "evidence_bullet_source_id_invalid"
+        if sid == "N/A":
+            if has_sources:
+                return False, "evidence_bullet_n/a_when_sources"
+        elif sid not in source_map:
+            return False, "evidence_bullet_source_id_not_in_sources"
+
+    # summary_steps: 2-5 items; each non-empty step, rationale; source_ids may be empty but must be subset of valid ids if present
+    ss = obj.get("summary_steps")
+    if not isinstance(ss, list) or not (2 <= len(ss) <= 5):
+        return False, "summary_steps_count_out_of_range"
+    valid_ids = set(source_map.keys())
+    step_verb_starts = ("confirm", "ensure", "check", "retry", "restart", "open", "disconnect", "reconnect", "verify", "sign in", "sign-in")
+    for s in ss:
+        if not isinstance(s, dict):
+            return False, "summary_step_not_object"
+        step = (s.get("step") or "").strip()
+        rationale = (s.get("rationale") or "").strip()
+        sids = s.get("source_ids")
+        if not step:
+            return False, "summary_step_step_empty"
+        if not rationale:
+            return False, "summary_step_rationale_empty"
+        if not isinstance(sids, list):
+            return False, "summary_step_source_ids_not_list"
+        if not all(isinstance(x, str) for x in sids):
+            return False, "summary_step_source_ids_not_strings"
+        for x in sids:
+            if x not in valid_ids:
+                return False, "summary_step_source_id_not_in_sources"
+        if has_sources and len(sids) == 0:
+            step_lower = step.lower()
+            if not any(step_lower.startswith(v) for v in step_verb_starts):
+                return False, "summary_step_unattributed_nonverb"
 
     cq = obj.get("clarifying_question")
     if not isinstance(cq, str):
@@ -632,6 +731,7 @@ def _validate_intermediate(obj: Any, source_map: Dict[str, Dict[str, str]]) -> T
 
     return True, ""
 
+# transfer context section as source, limit the content to 700 characters, output llm based only on source
 def _call_openai_intermediate(api_key: str, model: str, issue_text: str, context_sections: List[Dict]) -> Dict[str, Any]:
     sources, _ = build_source_catalog(context_sections)
 
@@ -652,18 +752,20 @@ def _call_openai_intermediate(api_key: str, model: str, issue_text: str, context
         "You are an internal IT helpdesk pipeline component.\n"
         "Return STRICT JSON only (no markdown, no extra text).\n"
         "Use ONLY the provided sources. Do not add any new facts.\n"
-        "bullets must be 2-5 items. Each bullet MUST be an object:\n"
-        '  {"text": "...", "source_id": "S1"}\n'
-        "source_id MUST be one of the provided source_id values.\n"
-        "clarifying_question: empty string OR ONE question.\n"
-        "confidence_level: High/Medium/Low.\n"
-        "confidence_reason: short.\n"
+        "Output schema (v2):\n"
+        "evidence_bullets: array of 2-8 objects, each { \"text\": string, \"source_id\": string }. "
+        "source_id MUST be one of the provided source_id values (e.g. S1, S2). One bullet per source quote/fact; do not merge.\n"
+        "summary_steps: array of 2-5 objects, each { \"step\": string (short imperative), \"rationale\": string (<=120 chars), \"source_ids\": string[] }. "
+        "source_ids MUST be a list; it MAY be empty only if the step truly cannot be attributed, but prefer including at least one valid source_id when possible. Each id must be from provided sources. You may merge/dedupe across sources.\n"
+        "clarifying_question: empty string OR one question (max 240 chars).\n"
+        "confidence_level: High | Medium | Low.\n"
+        "confidence_reason: short string.\n"
     )
 
     user_msg = (
         f"User request:\n{issue_text}\n\n"
         f"Sources (JSON):\n{json.dumps(compact_sources, ensure_ascii=False)}\n\n"
-        "Return JSON with keys: bullets, clarifying_question, confidence_level, confidence_reason."
+        "Return JSON with keys: summary_steps, evidence_bullets, clarifying_question, confidence_level, confidence_reason."
     )
 
     raw = call_openai_chat(
@@ -685,21 +787,19 @@ def _call_openai_intermediate(api_key: str, model: str, issue_text: str, context
             return json.loads(m.group(0))
         raise
 
+# 1. det for default, 2. if use_llm=false or openai fail, fall back to det 3. if use_llm, call LLM then _validate_intermediate_v2; if old format (bullets) or invalid, fall back to det
 def build_intermediate(
     context_sections: List[Dict],
     issue_text: str,
     use_llm: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Unified intermediate builder.
-    Returns: (intermediate, meta)
-      meta includes: used_llm(bool), fallback_reason(str)
+    Unified intermediate builder (v2 schema: summary_steps + evidence_bullets).
+    Returns: (intermediate, meta). meta includes used_llm(bool), fallback_reason(str).
     """
-    # Always have deterministic fallback ready
     det = _deterministic_intermediate(context_sections, issue_text)
 
     if not use_llm:
-        # Strip internal helper if present
         det.pop("_retrieval_confidence_num", None)
         return det, {"used_llm": False, "fallback_reason": ""}
 
@@ -713,7 +813,11 @@ def build_intermediate(
 
     try:
         obj = _call_openai_intermediate(api_key, model, issue_text, context_sections)
-        ok, reason = _validate_intermediate(obj, source_map)
+        # Reject old format (bullets) so we always use v2
+        if isinstance(obj, dict) and "bullets" in obj and "evidence_bullets" not in obj:
+            det.pop("_retrieval_confidence_num", None)
+            return det, {"used_llm": False, "fallback_reason": "invalid_intermediate:old_format_bullets"}
+        ok, reason = _validate_intermediate_v2(obj, source_map)
         if not ok:
             det.pop("_retrieval_confidence_num", None)
             return det, {"used_llm": False, "fallback_reason": f"invalid_intermediate:{reason}"}
@@ -726,7 +830,62 @@ def build_intermediate(
 # Proposal Builder (LLM propose, guarded)
 # ---------------------------
 
-ALLOWED_STATUS_LABELS = {"status:pending-approval", "status:triaged", "status:approved"}
+def validate_comment_summary(comment_summary: str, issue_text_normalized: str) -> Tuple[bool, str]:
+    """
+    Validate that LLM-proposed comment_summary does not introduce new facts.
+    Returns (ok, reason). reason is empty when ok is True.
+    """
+    if not isinstance(comment_summary, str) or not comment_summary.strip():
+        return True, ""
+    cs = comment_summary.strip()
+    if len(cs) > 200:
+        return False, "comment_summary_too_long"
+    issue_lower = (issue_text_normalized or "").lower()
+
+    # (b) No user-ID-like tokens unless present in issue
+    for m in re.finditer(r"\bu\d{3,}\b", cs, re.IGNORECASE):
+        token = m.group(0).lower()
+        if token not in issue_lower:
+            return False, "new_facts:user_id"
+
+    # (c) No quoted folder/resource names (double or single quotes) unless in issue
+    for m in re.finditer(r'["\']([^"\']+)["\']', cs):
+        quoted = m.group(1).strip()
+        if len(quoted) > 2 and quoted.lower() not in issue_lower:
+            return False, "new_facts:quoted_entity"
+
+    # (d) No duration/time windows unless in issue (e.g. "30 days", "2 weeks")
+    duration_pat = re.compile(r"\b(\d+\s*(?:days?|weeks?|months?|hours?))\b", re.IGNORECASE)
+    for m in duration_pat.finditer(cs):
+        if m.group(0).lower() not in issue_lower:
+            return False, "new_facts:duration"
+
+    # (e) No new capitalized multi-word entities (simple: words Cap Cap) unless substring in issue
+    cap_phrase = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
+    for m in cap_phrase.finditer(cs):
+        phrase = m.group(1)
+        if len(phrase) > 3 and phrase.lower() not in issue_lower:
+            return False, "new_facts:capitalized_entity"
+
+    return True, ""
+
+
+def _deterministic_comment_summary(intermediate: Optional[Dict] = None, proposed_actions: Optional[List[str]] = None) -> str:
+    """Build a safe comment_summary from intermediate summary_steps or proposed_actions (no LLM)."""
+    if intermediate:
+        steps = intermediate.get("summary_steps") or []
+        parts = []
+        for s in steps[:3]:
+            if isinstance(s, dict):
+                step = (s.get("step") or "").strip()
+                if step:
+                    parts.append(step)
+        if parts:
+            return "Proposed: " + "; ".join(parts)[:300]
+    if proposed_actions:
+        return "Proposed: " + "; ".join(proposed_actions[:3])[:300] if proposed_actions else "No actions"
+    return "Proposed: Follow the cited runbook steps."
+
 
 def _validate_proposal(obj: Any) -> Tuple[bool, str]:
     """
@@ -764,13 +923,18 @@ def _call_openai_proposal(api_key: str, model: str, issue_text: str, triage: Dic
     - LLM does NOT decide risk/approval/labels.
     - Output JSON only.
     """
-    # Keep intermediate compact
-    bullets = intermediate.get("bullets") or []
+    # v2: use summary_steps for plan summary
+    summary_steps = intermediate.get("summary_steps") or []
     cq = (intermediate.get("clarifying_question") or "").strip()
     bullets_text = "\n".join([
-        f"- {(b.get('text','') if isinstance(b, dict) else str(b))}"
-        for b in bullets[:5]
+        f"- {(s.get('step') or '')} — {(s.get('rationale') or '')}" if isinstance(s, dict) else str(s)
+        for s in summary_steps[:5]
     ])
+    if not bullets_text and intermediate.get("evidence_bullets"):
+        bullets_text = "\n".join([
+            f"- {(b.get('text','') if isinstance(b, dict) else str(b))}"
+            for b in (intermediate.get("evidence_bullets") or [])[:5]
+        ])
     cq_text = f"\nClarifying question: {cq}" if cq else ""
 
     system_msg = (
@@ -844,11 +1008,14 @@ def merge_and_guard_proposed_struct(
     triage: Dict[str, str],
     mode: str,
     proposal: Optional[Dict[str, Any]] = None,
+    issue_text_normalized: str = "",
+    proposal_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Guard rail:
-    - NEVER trust LLM for risk_level / needs_approval / approval_role / labels_to_add.
-    - Only allow LLM to improve comment_summary (and optionally assignees if allowlisted).
+    - NEVER trust LLM for risk_level / needs_approval / approval_role_required / labels_to_add.
+    - Only allow LLM comment_summary if it passes validate_comment_summary (no new facts).
+    - On validation failure, use deterministic comment_summary and set proposal_meta.fallback_reason.
     """
     out = dict(base_struct or {})
 
@@ -858,11 +1025,17 @@ def merge_and_guard_proposed_struct(
     status = "status:pending-approval" if out.get("needs_approval") else "status:triaged"
     out["labels_to_add"] = [f"cat:{cat}", f"prio:{prio}", status]
 
-    # LLM-proposed comment summary (safe)
+    # LLM-proposed comment summary: only use if validation passes (no invented entities/facts)
     if proposal and isinstance(proposal, dict):
         cs = proposal.get("comment_summary")
         if isinstance(cs, str) and cs.strip():
-            out["comment_summary"] = cs.strip()[:300]
+            ok, reason = validate_comment_summary(cs, issue_text_normalized)
+            if ok:
+                out["comment_summary"] = cs.strip()[:300]
+            else:
+                # Keep out["comment_summary"] from base_struct (deterministic); record rejection reason
+                if isinstance(proposal_meta, dict):
+                    proposal_meta["fallback_reason"] = proposal_meta.get("fallback_reason") or f"invalid_proposal:{reason}"
 
         # assignees: keep empty unless you explicitly allowlist later
         # If you want allowlist:
@@ -909,37 +1082,565 @@ def call_openai_chat(api_key: str, model: str, messages: List[Dict], max_tokens:
         raise RuntimeError(f"OpenAI request failed: {str(e)}") from e
 
 def answer_from_intermediate(intermediate: Dict[str, Any], source_map: Optional[Dict[str, Dict[str, str]]] = None) -> Tuple[str, List[str]]:
-    bullets = intermediate.get("bullets") or []
+    summary_steps = intermediate.get("summary_steps") or []
     cq = (intermediate.get("clarifying_question") or "").strip()
 
     answer_lines = ["Here’s what the runbooks suggest (ACL-filtered):"]
-    for b in bullets:
-        if isinstance(b, dict):
-            text = (b.get("text") or "").strip()
-            sid = (b.get("source_id") or "").strip()
-            if source_map and sid in source_map:
-                meta = source_map[sid]
-                cite = f'({meta["doc_name"]}{meta["anchor"]})'
-                answer_lines.append(f"- {text} {cite}")
-            else:
-                answer_lines.append(f"- {text}")
-        else:
-            answer_lines.append(f"- {str(b)}")
+    for s in summary_steps:
+        if isinstance(s, dict):
+            step = (s.get("step") or "").strip()
+            rationale = (s.get("rationale") or "").strip()
+            source_ids = s.get("source_ids") or []
+            citation_suffix = ""
+            if source_map and source_ids:
+                cite_parts = []
+                for sid in source_ids:
+                    if sid in source_map:
+                        meta = source_map[sid]
+                        tier = meta.get("tier") or ""
+                        doc_anchor = (meta.get("doc_name") or "") + (meta.get("anchor") or "")
+                        cite_parts.append(f"{tier}:{doc_anchor}" if tier else doc_anchor)
+                if cite_parts:
+                    citation_suffix = " (" + ", ".join(cite_parts) + ")"
+            if step:
+                if rationale:
+                    answer_lines.append(f"- {step} — {rationale}{citation_suffix}")
+                else:
+                    answer_lines.append(f"- {step}{citation_suffix}")
 
     if cq:
         answer_lines.append("")
         answer_lines.append(f"Clarifying question: {cq}")
 
-    proposed_actions = ["Follow the cited runbook steps"]
+    # proposed_actions from summary_steps.step (top 3)
+    proposed_actions = []
+    for s in summary_steps[:3]:
+        if isinstance(s, dict):
+            step = (s.get("step") or "").strip()
+            if step:
+                proposed_actions.append(step)
+
+    if not proposed_actions:
+        proposed_actions = ["Follow the cited runbook steps"]
+
     if cq:
         proposed_actions.append("Provide requested details to proceed")
 
     return "\n".join(answer_lines), proposed_actions
 
+
+# ---------------------------
+# main() helpers
+# ---------------------------
+
+def _exit_with_error(
+    message: str, debug_error: str, code: int = 1, proposed_actions: Optional[List[str]] = None, **debug_extra: Any
+) -> None:
+    """Print JSON error payload and exit. Used for CLI/validation failures."""
+    payload = {
+        "answer": message,
+        "citations": [],
+        "triage": {"category": "Other", "priority": "Low"},
+        "retrieval_confidence": 0.0,
+        "proposed_actions": proposed_actions if proposed_actions is not None else [],
+        "debug": {"error": debug_error, **debug_extra},
+    }
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def _finalize_audit(
+    audit_record: Dict,
+    audit_path: Path,
+    repo_root: Path,
+    start_time_perf: float,
+) -> None:
+    """Set latency_ms and append audit record once."""
+    import time as _time
+    from . import audit
+    latency_ms = round((_time.perf_counter() - start_time_perf) * 1000)
+    audit_record["latency_ms"] = latency_ms
+    audit.append_jsonl(audit_record, path=audit_path, repo_root=repo_root)
+
+
+def _maybe_post_rejection_comment(
+    github_bot: Any, repo: str, issue_number: int, execution_result: str
+) -> None:
+    """Post a rejection comment only for these execution_result values."""
+    if execution_result in (
+        "rejected_employee_approval",
+        "rejected_l2_requires_it_admin",
+        "rejected_l1_requires_engineer_or_admin",
+        "approver_not_in_directory",
+        "invalid_plan_format",
+        "no_proposed_plan",
+    ):
+        github_bot.post_comment(repo, issue_number, _rejection_comment_message(execution_result))
+
+
+def _require_github_args_or_exit(args: Any) -> None:
+    if args.mode == "github" and (not args.repo or args.issue_number is None):
+        _exit_with_error(
+            "Error: --repo and --issue_number are required when --mode github",
+            "github_requires_repo_and_issue",
+        )
+
+
+def _get_issue_text_or_exit(args: Any) -> Tuple[str, str, Optional[str]]:
+    """Returns (issue_text, issue_text_source, issue_author_login or None). Author login is set when mode=github and issue was fetched from API."""
+    issue_text = (args.issue or "").strip()
+    issue_text_source = "cli_arg" if issue_text else ""
+    issue_author_login: Optional[str] = None
+    if args.mode == "github" and not issue_text:
+        from . import github_bot
+        try:
+            gh_issue = github_bot.get_issue(args.repo, args.issue_number)
+            title = (gh_issue.get("title") or "").strip()
+            body = (gh_issue.get("body") or "").strip()
+            issue_text = (title + "\n\n" + body).strip() if body else title
+            issue_text_source = "github_issue"
+            issue_author_login = (gh_issue.get("user") or {}).get("login") or ""
+        except Exception as e:
+            _exit_with_error(
+                f"Error: --issue is missing and failed to read GitHub issue text: {str(e)}",
+                "github_issue_fetch_failed",
+            )
+    if not issue_text:
+        _exit_with_error(
+            "Error: --issue is required in --mode cli (or provide --mode github with a valid issue_number).",
+            "missing_issue_text",
+        )
+    return issue_text, issue_text_source, issue_author_login
+
+
+def _load_directory_or_exit(repo_root: Path) -> Tuple[Dict, Dict]:
+    directory_path = repo_root / "workflows" / "directory.csv"
+    if not directory_path.exists():
+        _exit_with_error(
+            f"Error: Directory file not found at {directory_path}",
+            "directory_not_found",
+            proposed_actions=["Check directory.csv path"],
+        )
+    return load_directory(str(directory_path))
+
+
+def _resolve_user_or_exit(
+    args: Any, directory: Dict, by_github_username: Dict, issue_author_login: Optional[str] = None
+) -> Tuple[str, List[str]]:
+    """Resolve role and allowed_tiers. In GitHub mode, if --user_id is missing, resolve from issue author via directory."""
+    if args.mode == "github" and not (args.user_id or "").strip():
+        if issue_author_login and (issue_author_login.strip().lower() in by_github_username):
+            u = by_github_username[issue_author_login.strip().lower()]
+            args.user_id = u["user_id"]
+            ent = directory.get(args.user_id)
+            if ent:
+                return ent["role"], ent["allowed_tiers"]
+        args.user_id = ""
+        setattr(args, "_github_author_unresolved", True)
+        return ("Unknown", ["public"])
+    if not (args.user_id or "").strip():
+        _exit_with_error(
+            "Error: --user_id is required in --mode cli.",
+            "user_id_required_cli",
+            proposed_actions=["Provide --user_id or run in --mode github with issue author in directory"],
+        )
+    user_info = resolve_user(args.user_id, directory, args.role_override)
+    if not user_info:
+        _exit_with_error(
+            f"Error: User ID '{args.user_id}' not found in directory",
+            "user_not_found",
+            proposed_actions=["Provide valid user_id or use --role_override"],
+            user_id=args.user_id,
+        )
+    return user_info["role"], user_info["allowed_tiers"]
+
+
+def _load_sections(repo_root: Path, allowed_tiers: List[str]) -> List[Dict]:
+    return load_allowed_documents(allowed_tiers, repo_root / "docs")
+
+
+def _run_retrieval(
+    args: Any, issue_text: str, all_sections: List[Dict], repo_root: Path
+) -> Tuple[List[Dict], Dict[str, Any]]:
+    from . import retrieval as retrieval_mod
+    index_bundle = None
+    if args.retriever in ("vector", "hybrid"):
+        index_bundle = retrieval_mod.build_or_load_vector_index(
+            all_sections, repo_root / "workflows", rebuild=args.rebuild_index
+        )
+    retrieved, retriever_debug = retrieval_mod.retrieve(
+        issue_text,
+        all_sections,
+        top_k=args.top_k,
+        retriever_type=args.retriever,
+        candidate_k=args.candidate_k,
+        index_bundle=index_bundle,
+        hybrid_alpha=args.hybrid_alpha,
+        troubleshoot_bias=not args.no_troubleshoot_bias,
+    )
+    return retrieved, retriever_debug
+
+
+def _citations_from_intermediate(intermediate: Dict[str, Any], retrieved: List[Dict]) -> List[Dict]:
+    """Build citations list from evidence_bullets' source_ids only (order preserved, de-duplicated)."""
+    source_id_to_section = {f"S{i}": s for i, s in enumerate(retrieved, start=1)}
+    seen: Set[str] = set()
+    ordered_ids: List[str] = []
+    for b in intermediate.get("evidence_bullets") or []:
+        if not isinstance(b, dict):
+            continue
+        sid = (b.get("source_id") or "").strip()
+        if sid and sid != "N/A" and sid not in seen and sid in source_id_to_section:
+            seen.add(sid)
+            ordered_ids.append(sid)
+    citations = []
+    for sid in ordered_ids:
+        s = source_id_to_section[sid]
+        citations.append({
+            "doc": s["doc_path"],
+            "section": s.get("heading", ""),
+            "anchor": s.get("anchor", ""),
+            "tier": s.get("tier", ""),
+        })
+    return citations
+
+
+def _citations_from_retrieved(retrieved: List[Dict]) -> List[Dict]:
+    """Return citations-style list for all retrieved sections (doc, section, anchor, tier), in order."""
+    return [
+        {"doc": s["doc_path"], "section": s.get("heading", ""), "anchor": s.get("anchor", ""), "tier": s.get("tier", "")}
+        for s in retrieved
+    ]
+
+
+def _build_answer_and_actions(
+    args: Any, issue_text: str, retrieved: List[Dict], issue_text_source: str = "cli_arg"
+) -> Tuple[Dict, Dict, Dict, Optional[Dict], Dict]:
+    _, source_map = build_source_catalog(retrieved)
+    use_llm = bool(args.llm_intermediate)
+    intermediate, intermediate_meta = build_intermediate(retrieved, issue_text, use_llm=use_llm)
+    answer_text, proposed_actions = answer_from_intermediate(intermediate, source_map=source_map)
+    max_score = max((s.get("final_score", s.get("score", 0)) for s in retrieved), default=0)
+    retrieval_conf = confidence_from_max_score(max_score)
+    if max_score == 0:
+        retrieval_conf = 0.25
+
+    # Align intermediate confidence with retrieval_confidence (single source of truth)
+    intermediate["confidence_level"] = (
+        "High" if retrieval_conf >= 0.70 else
+        "Medium" if retrieval_conf >= 0.45 else
+        "Low"
+    )
+    prefix = f"retrieval_confidence={retrieval_conf:.2f}; "
+    existing_reason = intermediate.get("confidence_reason")
+    if not isinstance(existing_reason, str):
+        existing_reason = "" if existing_reason is None else str(existing_reason)
+    existing_reason = existing_reason.strip()
+    if not existing_reason.startswith("retrieval_confidence="):
+        intermediate["confidence_reason"] = (prefix + existing_reason).strip()
+    else:
+        intermediate["confidence_reason"] = existing_reason
+
+    answer_data = {
+        "answer": answer_text,
+        "citations": _citations_from_intermediate(intermediate, retrieved),
+        "confidence": retrieval_conf,
+        "proposed_actions": proposed_actions,
+        "intermediate": intermediate,
+        "intermediate_meta": intermediate_meta,
+    }
+    triage_data = triage_issue(issue_text, source=issue_text_source or "cli_arg")
+    proposed_actions_struct = build_proposed_actions_struct(triage_data, answer_data["proposed_actions"])
+    proposal, proposal_meta = build_proposal(
+        issue_text=issue_text, triage=triage_data, intermediate=intermediate, use_llm=bool(args.llm_propose)
+    )
+    proposed_actions_struct = merge_and_guard_proposed_struct(
+        base_struct=proposed_actions_struct,
+        triage=triage_data,
+        mode=args.mode,
+        proposal=proposal,
+        issue_text_normalized=issue_text,
+        proposal_meta=proposal_meta,
+    )
+    return answer_data, triage_data, proposed_actions_struct, proposal, proposal_meta
+
+
+def _build_output_json(
+    args: Any,
+    answer_data: Dict,
+    triage_data: Dict,
+    proposed_actions_struct: Dict,
+    proposal: Optional[Dict],
+    proposal_meta: Dict,
+    role: str,
+    allowed_tiers: List[str],
+    issue_text_source: str,
+    issue_text_raw: str,
+    issue_text_normalized: str,
+    retrieved: List[Dict],
+    retriever_debug: Dict,
+) -> Dict:
+    debug_retrieved = []
+    for s in retrieved:
+        entry = {"doc": s["doc_path"], "section": s["heading"], "tier": s["tier"], "score": s.get("score", 0)}
+        if "final_score" in s:
+            entry["final_score"] = s["final_score"]
+        if "keyword_score" in s:
+            entry["keyword_score"] = s["keyword_score"]
+        if "keyword_norm" in s:
+            entry["keyword_norm"] = s["keyword_norm"]
+        if "vector_score" in s:
+            entry["vector_score"] = s["vector_score"]
+        debug_retrieved.append(entry)
+    return {
+        "answer": answer_data["answer"],
+        "citations": answer_data["citations"],
+        "retrieved_citations_topk": _citations_from_retrieved(retrieved),
+        **({"intermediate": answer_data.get("intermediate", {})} if args.llm_intermediate else {}),
+        **({"intermediate_meta": answer_data.get("intermediate_meta", {})} if args.llm_intermediate else {}),
+        **({"proposal": proposal} if args.llm_propose else {}),
+        **({"proposal_meta": proposal_meta} if args.llm_propose else {}),
+        "triage": triage_data,
+        "triage_method": "keyword",
+        "retrieval_confidence": answer_data["confidence"],
+        "proposed_actions": answer_data["proposed_actions"],
+        "proposed_actions_struct": proposed_actions_struct,
+        "debug": {
+            "user_id": args.user_id,
+            "role": role,
+            "allowed_tiers": allowed_tiers,
+            "issue_text_source": issue_text_source,
+            "issue_text_preview": issue_text_normalized[:200],
+            "issue_text_preview_raw": issue_text_raw[:200],
+            "issue_text_normalized": issue_text_normalized,
+            "issue_text_raw": issue_text_raw,
+            "retrieved": debug_retrieved,
+            "llm_propose": bool(args.llm_propose),
+             # --- LLM intermediate telemetry (truthy even when LLM falls back) ---
+            "llm_intermediate_requested": bool(args.llm_intermediate),
+            "llm_intermediate_used": bool((answer_data.get("intermediate_meta") or {}).get("used_llm", False)),
+            "llm_intermediate_fallback_reason": (answer_data.get("intermediate_meta") or {}).get("fallback_reason", ""),
+            "retriever_type": retriever_debug.get("retriever_type", "keyword"),
+            "candidate_k": retriever_debug.get("candidate_k"),
+            "vector_index_info": retriever_debug.get("vector_index_info"),
+            "hybrid_alpha": retriever_debug.get("hybrid_alpha"),
+            "troubleshoot_bias": retriever_debug.get("troubleshoot_bias"),
+            "troubleshoot_intent_detected": retriever_debug.get("troubleshoot_intent_detected"),
+        },
+    }
+
+
+def _rejection_comment_message(execution_result: str) -> str:
+    """Human-readable rejection message for execute stage."""
+    messages = {
+        "rejected_employee_approval": "**Approval rejected.** Employees cannot approve execution. Only an Engineer or IT Admin may comment APPROVE to execute. No actions were performed.",
+        "rejected_l2_requires_it_admin": "**Approval rejected.** This plan requires IT Admin approval. Only a user with the IT Admin role in our directory may approve. No actions were performed.",
+        "rejected_l1_requires_engineer_or_admin": "**Approval rejected.** This plan requires an Engineer or IT Admin to approve. Your role does not have approval permission. No actions were performed.",
+        "approver_not_in_directory": "**Approval rejected.** Your GitHub username is not in our directory, so we could not verify your role. No actions were performed. Please ask an IT Admin or Engineer listed in the directory to comment APPROVE.",
+        "invalid_plan_format": "**Invalid plan format.** We could not parse the proposed actions from the latest plan comment. No actions were performed.",
+        "no_proposed_plan": "**No proposed plan found.** There is no Proposed Plan comment on this issue. Open the issue so the bot can post a plan, then comment APPROVE to execute (if your role is allowed). No actions were performed.",
+    }
+    return messages.get(execution_result, "**Approval could not be processed.** No actions were performed.")
+
+
+def _apply_approved_actions(
+    repo: str, issue_number: int, struct_for_execute: Dict, github_bot_module: Any
+) -> List[str]:
+    """Apply labels and assignees from approved struct; post Executed actions comment. Returns executed_actions list. Idempotent: skips if status:executed already set."""
+    current_labels = github_bot_module.get_issue_labels(repo, issue_number) or []
+    if "status:executed" in current_labels:
+        return []
+    base_labels = [lb for lb in (struct_for_execute.get("labels_to_add") or []) if not str(lb).startswith("status:")]
+    labels = base_labels + ["status:executed"]
+    executed: List[str] = []
+    if labels:
+        github_bot_module.add_labels(repo, issue_number, labels, remove_prefixes=["status:"])
+        executed.append("add_labels")
+    if struct_for_execute.get("assignees"):
+        github_bot_module.add_assignees(repo, issue_number, struct_for_execute["assignees"])
+        executed.append("add_assignees")
+    github_bot_module.post_comment(
+        repo, issue_number,
+        "## Executed actions\n\n" + json.dumps({"executed": executed}, indent=2)
+    )
+    return executed
+
+
+def _write_audit_and_maybe_github(
+    args: Any,
+    output: Dict,
+    answer_data: Dict,
+    triage_data: Dict,
+    proposed_actions_struct: Dict,
+    proposal: Optional[Dict],
+    proposal_meta: Dict,
+    retrieved: List[Dict],
+    retriever_debug: Dict,
+    by_github_username: Dict,
+    repo_root: Path,
+    audit_path: Path,
+    start_time_perf: float,
+    issue_text_source: str,
+    issue_text_raw: str,
+    issue_text_normalized: str,
+) -> None:
+    import time as _time
+    from . import audit
+    debug_retrieved = output["debug"]["retrieved"]
+    audit_record = {
+        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "repo": str(args.repo) if (args.mode == "github" and args.repo) else "",
+        "issue_number": int(args.issue_number) if (args.mode == "github" and args.issue_number is not None) else 0,
+        "requester_user_id": str(args.user_id),
+        "requester_role": output["debug"]["role"],
+        "allowed_tiers": list(output["debug"]["allowed_tiers"]),
+        "triage": {**triage_data, "method": "keyword"},
+        "retrieval_confidence": float(output["retrieval_confidence"]),
+        "retrieved": debug_retrieved,
+        "citations": output["citations"],
+        "proposed_actions_struct": proposed_actions_struct,
+        "approval_status": "n/a",
+        "approval_actor_login": "",
+        "approval_actor_role": "",
+        "executed_actions": [],
+        "execution_result": "n/a",
+        "latency_ms": 0,
+        "estimated_cost": 0,
+        "issue_text_source": issue_text_source,
+        "issue_text_len": len(issue_text_normalized),
+        "llm_propose": bool(args.llm_propose),
+        "proposal_meta": proposal_meta if args.llm_propose else {},
+        "issue_text_len_raw": len(issue_text_raw),
+        "retriever_type": retriever_debug.get("retriever_type", "keyword"),
+        "candidate_k": retriever_debug.get("candidate_k"),
+        "vector_model_name": (retriever_debug.get("vector_index_info") or {}).get("model_name") or "",
+    }
+    if args.mode == "github":
+        from . import github_bot
+        try:
+            if getattr(args, "github_stage", "propose") == "propose":
+                plan_title = _plan_title(proposed_actions_struct.get("needs_approval", False))
+                short_plan = (
+                    "## " + plan_title + "\n\n"
+                    + (proposed_actions_struct.get("comment_summary", "").strip() + "\n\n" if proposed_actions_struct.get("comment_summary") else "")
+                    + answer_data["answer"]
+                )
+                _, source_map_plan = build_source_catalog(retrieved)
+                def _sources_map_line(sid: str, m: Dict) -> str:
+                    tier = m.get("tier") or ""
+                    doc_anchor = (m.get("doc_name") or "") + (m.get("anchor") or "")
+                    prefix = f"{tier}:" if tier else ""
+                    return f"{sid} -> {prefix}{doc_anchor} ({m.get('heading', '')})"
+
+                sources_map_lines = [_sources_map_line(sid, m) for sid, m in sorted(source_map_plan.items())]
+                sources_map_block = "### Sources map\n\n" + "\n".join(sources_map_lines) + "\n\n" if sources_map_lines else ""
+                details_content = (
+                    sources_map_block
+                    + "### Intermediate (evidence summary)\n\n```json\n"
+                    + json.dumps(answer_data.get("intermediate", {}), indent=2)
+                    + "\n```\n\n### Intermediate meta\n\n```json\n"
+                    + json.dumps(answer_data.get("intermediate_meta", {}), indent=2)
+                    + "\n```\n\n### Proposed actions (struct)\n\n```json\n"
+                    + json.dumps(proposed_actions_struct, indent=2)
+                    + "\n```\n\n### Proposal meta\n\n```json\n"
+                    + json.dumps(proposal_meta if args.llm_propose else {}, indent=2)
+                    + "\n```\n\n### Proposal (LLM)\n\n```json\n"
+                    + json.dumps(proposal if args.llm_propose else {}, indent=2)
+                    + "\n```\n"
+                )
+                plan_body = short_plan + "\n\n<details><summary>Details (evidence + struct)</summary>" + details_content + "\n</details>\n"
+                github_bot.post_comment(args.repo, args.issue_number, plan_body)
+                labels = list(proposed_actions_struct.get("labels_to_add") or [])
+                if labels:
+                    github_bot.add_labels(args.repo, args.issue_number, labels, remove_prefixes=["status:"])
+                if not proposed_actions_struct.get("needs_approval"):
+                    executed_actions = _apply_approved_actions(args.repo, args.issue_number, proposed_actions_struct, github_bot)
+                    audit_record["executed_actions"] = executed_actions
+                    audit_record["execution_result"] = "propose_and_execute"
+                else:
+                    audit_record["execution_result"] = "propose_only"
+            else:
+                current_labels = github_bot.get_issue_labels(args.repo, args.issue_number) or []
+                if "status:executed" in current_labels:
+                    audit_record["execution_result"] = "already_executed_noop"
+                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+                    return
+                comments = github_bot.list_comments(args.repo, args.issue_number)
+                plan_comment, parsed_struct, approve_comment = _find_latest_proposed_plan_and_approve(comments)
+                if plan_comment is None:
+                    audit_record["execution_result"] = "no_proposed_plan"
+                    _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, "no_proposed_plan")
+                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+                    return
+                if parsed_struct is None:
+                    audit_record["approval_status"] = "rejected"
+                    audit_record["execution_result"] = "invalid_plan_format"
+                    _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, "invalid_plan_format")
+                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+                    return
+                struct_for_execute = parsed_struct
+                if struct_for_execute.get("needs_approval") is False:
+                    audit_record["approval_status"] = "n/a"
+                    audit_record["execution_result"] = "l1_noop"
+                    audit_record["executed_actions"] = []
+                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+                    return
+                approval_status = "pending"
+                approval_actor_login = ""
+                approval_actor_role = ""
+                executed_actions: List[str] = []
+                execution_result = "no_approval_found"  # plan exists, struct OK; no APPROVE comment after it
+                if approve_comment:
+                    approval_actor_login = (
+                        approve_comment.get("login")
+                        or (approve_comment.get("user") or {}).get("login")
+                        or ""
+                    )
+                    login_lower = approval_actor_login.lower()
+                    approver_info = by_github_username.get(login_lower)
+                    if approver_info:
+                        approval_actor_role = approver_info.get("role") or ""
+                        if approval_actor_role == "Employee":
+                            approval_status = "rejected"
+                            execution_result = "rejected_employee_approval"
+                        elif struct_for_execute.get("needs_approval"):
+                            if struct_for_execute.get("risk_level") == "L2":
+                                if approval_actor_role != "IT Admin":
+                                    approval_status = "rejected"
+                                    execution_result = "rejected_l2_requires_it_admin"
+                                else:
+                                    approval_status = "approved"
+                                    executed_actions = _apply_approved_actions(args.repo, args.issue_number, struct_for_execute, github_bot)
+                                    execution_result = "already_approved_skip" if not executed_actions else "success"
+                            else:
+                                if approval_actor_role not in ("Engineer", "IT Admin"):
+                                    approval_status = "rejected"
+                                    execution_result = "rejected_l1_requires_engineer_or_admin"
+                                else:
+                                    approval_status = "approved"
+                                    executed_actions = _apply_approved_actions(args.repo, args.issue_number, struct_for_execute, github_bot)
+                                    execution_result = "already_approved_skip" if not executed_actions else "success"
+                    else:
+                        approval_status = "rejected"
+                        execution_result = "approver_not_in_directory"
+                _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, execution_result)
+                audit_record["approval_status"] = approval_status
+                audit_record["approval_actor_login"] = approval_actor_login or ""
+                audit_record["approval_actor_role"] = approval_actor_role or ""
+                audit_record["executed_actions"] = executed_actions
+                audit_record["execution_result"] = execution_result
+        except Exception as e:
+            audit_record["execution_result"] = "error"
+            audit_record["error"] = str(e)
+            audit_record["executed_actions"] = []
+            output["debug"]["github_error"] = str(e)
+    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+
+
 def main():
-    # create input parameters/format, required means must, help is just a description for error output
+    import time as _time
     parser = argparse.ArgumentParser(description="MVP Retrieval + Citations + ACL Pipeline")
-    parser.add_argument("--user_id", required=True, help="User ID from directory.csv")
+    parser.add_argument("--user_id", default=None, help="User ID from directory.csv (required in CLI mode; optional in GitHub mode: resolved from issue author via directory)")
     parser.add_argument("--issue", help="Issue/question text (optional in --mode github; will read from GitHub issue if omitted)")
     parser.add_argument("--top_k", type=int, default=3, help="Number of sections to retrieve (default: 3)")
     parser.add_argument("--mode", choices=["cli", "github"], default="cli", help="Output channel: cli prints JSON to stdout; github posts to GitHub (default: cli)")
@@ -955,426 +1656,63 @@ def main():
     parser.add_argument("--hybrid_alpha", type=float, default=0.7, help="Hybrid retriever: final_score = alpha*kw_norm + (1-alpha)*vector_score; kw_norm in [0,1] (default: 0.7)")
     parser.add_argument("--no_troubleshoot_bias", action="store_true", help="Disable troubleshooting intent bias in retrieval (bias ON by default: boosts verify/troubleshoot sections when query suggests trouble)")
     args = parser.parse_args()
-    import time as _time
     _start_audit = _time.perf_counter()
 
-    # if mode is github, repo and issue_number are required to get issue text
-    if args.mode == "github" and (not args.repo or args.issue_number is None):
-        error_output = {
-            "answer": "Error: --repo and --issue_number are required when --mode github",
-            "citations": [],
-            "triage": {"category": "Other", "priority": "Low"},
-            "retrieval_confidence": 0.0,
-            "proposed_actions": [],
-            "debug": {"error": "github_requires_repo_and_issue"},
-        }
-        print(json.dumps(error_output, indent=2))
-        sys.exit(1)
-    
-    # Determine issue_text, if provide as '-- issue' use it and mark cli, otherwise remain empty, may pull from github later
-    issue_text = (args.issue or "").strip()
-    issue_text_source = "cli_arg" if issue_text else ""
+    _require_github_args_or_exit(args)
+    issue_text_raw, issue_text_source, issue_author_login = _get_issue_text_or_exit(args)
+    issue_text = normalize_issue_text(issue_text_raw, issue_text_source)
 
-    if args.mode == "github" and not issue_text:
-        # Pull from GitHub issue (title + body)
-        from . import github_bot
-        try:
-            gh_issue = github_bot.get_issue(args.repo, args.issue_number)
-            title = (gh_issue.get("title") or "").strip()
-            body = (gh_issue.get("body") or "").strip()
-            issue_text = (title + "\n\n" + body).strip() if body else title
-            issue_text_source = "github_issue"
-        except Exception as e:
-            error_output = {
-                "answer": f"Error: --issue is missing and failed to read GitHub issue text: {str(e)}",
-                "citations": [],
-                "triage": {"category": "Other", "priority": "Low"},
-                "retrieval_confidence": 0.0,
-                "proposed_actions": [],
-                "debug": {"error": "github_issue_fetch_failed"},
-            }
-            print(json.dumps(error_output, indent=2))
-            sys.exit(1)
-
-    if not issue_text:
-        error_output = {
-            "answer": "Error: --issue is required in --mode cli (or provide --mode github with a valid issue_number).",
-            "citations": [],
-            "triage": {"category": "Other", "priority": "Low"},
-            "retrieval_confidence": 0.0,
-            "proposed_actions": [],
-            "debug": {"error": "missing_issue_text"},
-        }
-        print(json.dumps(error_output, indent=2))
-        sys.exit(1)
-
-    issue_text_raw = issue_text
-    issue_text = normalize_issue_text(issue_text, issue_text_source)
-
-    # Load directory
     repo_root = Path(__file__).parent.parent
-    directory_path = repo_root / "workflows" / "directory.csv"
-    
-    if not directory_path.exists():
-        error_output = {
-            "answer": f"Error: Directory file not found at {directory_path}",
-            "citations": [],
-            "triage": {"category": "Other", "priority": "Low"},
-            "retrieval_confidence": 0.0,
-            "proposed_actions": ["Check directory.csv path"],
-            "debug": {"error": "directory_not_found"},
-        }
-        print(json.dumps(error_output, indent=2))
-        sys.exit(1)
-    
-    directory, by_github_username = load_directory(str(directory_path))
-
-    # Resolve user
-    user_info = resolve_user(args.user_id, directory, args.role_override)
-    if not user_info:
-        error_output = {
-            "answer": f"Error: User ID '{args.user_id}' not found in directory",
-            "citations": [],
-            "triage": {"category": "Other", "priority": "Low"},
-            "retrieval_confidence": 0.0,
-            "proposed_actions": ["Provide valid user_id or use --role_override"],
-            "debug": {"error": "user_not_found", "user_id": args.user_id},
-        }
-        print(json.dumps(error_output, indent=2))
-        sys.exit(1)
-    
-    allowed_tiers = user_info["allowed_tiers"]
-    role = user_info["role"]
-    
-    # Load allowed documents
-    docs_root = repo_root / "docs"
-    all_sections = load_allowed_documents(allowed_tiers, docs_root)
-
-    # Retrieve: keyword (default) or vector/hybrid via retrieval.retrieve
-    from . import retrieval as retrieval_mod
-    index_bundle = None
-    if args.retriever in ("vector", "hybrid"):
-        cache_dir = repo_root / "workflows"
-        index_bundle = retrieval_mod.build_or_load_vector_index(
-            all_sections, cache_dir, rebuild=args.rebuild_index
-        )
-    retrieved, retriever_debug = retrieval_mod.retrieve(
-        issue_text,
-        all_sections,
-        top_k=args.top_k,
-        retriever_type=args.retriever,
-        candidate_k=args.candidate_k,
-        index_bundle=index_bundle,
-        hybrid_alpha=args.hybrid_alpha,
-        troubleshoot_bias=not args.no_troubleshoot_bias,
-    )
-    _, source_map = build_source_catalog(retrieved)
-    
-    # Build citations from retrieved sections (single source of truth)
-    citations = []
-    for section in retrieved:
-        citations.append({
-            "doc": section["doc_path"],
-            "section": section["heading"],
-            "anchor": section.get("anchor", ""),
-            "tier": section["tier"],
-        })
-
-    # Build intermediate (unified). 
-    # Enterprise-safe default: LLM intermediate is opt-in only
-    use_llm = bool(args.llm_intermediate)  # opt-in only
-    intermediate, intermediate_meta = build_intermediate(retrieved, issue_text, use_llm=use_llm)
-
-    # Final answer comes LINEARLY from intermediate (single truth)
-    answer_text, proposed_actions = answer_from_intermediate(intermediate, source_map=source_map)
-
-    # Retrieval confidence for output: prefer intermediate-derived if present, else deterministic helper
-    # If you kept det helper _retrieval_confidence_num, it was stripped before returning.
-    # Use final_score when present (hybrid/vector/keyword all set it) so confidence reflects ranking score
-    max_score = max((s.get("final_score", s.get("score", 0)) for s in retrieved), default=0)
-    retrieval_conf = confidence_from_max_score(max_score, k=12.0)
-    if max_score == 0:
-        retrieval_conf = 0.25
-
-    answer_data = {
-        "answer": answer_text,
-        "citations": citations,
-        "confidence": retrieval_conf,  # keep as retrieval_confidence (system gating)
-        "proposed_actions": proposed_actions,
-        "intermediate": intermediate,
-        "intermediate_meta": intermediate_meta,
-    }
-
-    # Triage (deterministic)
-    triage_data = triage_issue(issue_text)
-
-    # Base proposed_actions_struct (deterministic gate)
-    proposed_actions_struct = build_proposed_actions_struct(
-        triage_data, answer_data["proposed_actions"], args.mode
-    )
-
-    # LLM propose (optional, plan-writing only)
-    proposal, proposal_meta = build_proposal(
-        issue_text=issue_text,
-        triage=triage_data,
-        intermediate=intermediate,
-        use_llm=bool(args.llm_propose),
-    )
-
-    # Guarded merge: never trust LLM for risk/approval/labels
-    proposed_actions_struct = merge_and_guard_proposed_struct(
-        base_struct=proposed_actions_struct,
-        triage=triage_data,
-        mode=args.mode,
-        proposal=proposal,
-    )
-
-    # Build base output (triage_method=keyword, retrieval_confidence); scoring fields explicit for debug
-    debug_retrieved = []
-    for s in retrieved:
-        entry = {"doc": s["doc_path"], "section": s["heading"], "tier": s["tier"], "score": s["score"]}
-        if "final_score" in s:
-            entry["final_score"] = s["final_score"]
-        if "keyword_score" in s:
-            entry["keyword_score"] = s["keyword_score"]
-        if "keyword_norm" in s:
-            entry["keyword_norm"] = s["keyword_norm"]
-        if "vector_score" in s:
-            entry["vector_score"] = s["vector_score"]
-        debug_retrieved.append(entry)
-    output = {
-        "answer": answer_data["answer"],
-        "citations": answer_data["citations"],
-        **({"intermediate": answer_data.get("intermediate", {})} if args.llm_intermediate else {}),
-        **({"intermediate_meta": answer_data.get("intermediate_meta", {})} if args.llm_intermediate else {}),
-        **({"proposal": proposal} if args.llm_propose else {}),
-        **({"proposal_meta": proposal_meta} if args.llm_propose else {}),
-        "triage": triage_data,
-        "triage_method": "keyword",
-        "retrieval_confidence": answer_data["confidence"],
-        "proposed_actions": answer_data["proposed_actions"],
-        "proposed_actions_struct": proposed_actions_struct,
-        "debug": {
-            "user_id": args.user_id,
-            "role": role,
-            "allowed_tiers": allowed_tiers,
-            "issue_text_source": issue_text_source,
-            "issue_text_preview": issue_text[:200],
-            "issue_text_preview_raw": issue_text_raw[:200],
-            "retrieved": debug_retrieved,
-            "llm_propose": bool(args.llm_propose),
-            "retriever_type": retriever_debug.get("retriever_type", "keyword"),
-            "candidate_k": retriever_debug.get("candidate_k"),
-            "vector_index_info": retriever_debug.get("vector_index_info"),
-            "hybrid_alpha": retriever_debug.get("hybrid_alpha"),
-            "troubleshoot_bias": retriever_debug.get("troubleshoot_bias"),
-            "troubleshoot_intent_detected": retriever_debug.get("troubleshoot_intent_detected"),
-        },
-    }
-
-    # Audit log (every run)
-    repo_root = Path(__file__).parent.parent
+    directory, by_github_username = _load_directory_or_exit(repo_root)
+    role, allowed_tiers = _resolve_user_or_exit(args, directory, by_github_username, issue_author_login)
     audit_path = repo_root / "workflows" / "audit_log.jsonl"
-    audit_record = {
-        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-        "repo": str(args.repo) if (args.mode == "github" and args.repo) else "",
-        "issue_number": int(args.issue_number) if (args.mode == "github" and args.issue_number is not None) else 0,
-        "requester_user_id": str(args.user_id),
-        "requester_role": str(role),
-        "allowed_tiers": list(allowed_tiers),
-        "triage": {**triage_data, "method": "keyword"},
-        "retrieval_confidence": float(output["retrieval_confidence"]),
-        "retrieved": debug_retrieved,
-        "citations": output["citations"],
-        "proposed_actions_struct": proposed_actions_struct,
-        "approval_status": "n/a",
-        "approval_actor_login": "",
-        "approval_actor_role": "",
-        "executed_actions": [],
-        "execution_result": "n/a",
-        "latency_ms": 0,
-        "estimated_cost": 0,
-        "issue_text_source": issue_text_source,
-        "issue_text_len": len(issue_text),
-        "llm_propose": bool(args.llm_propose),
-        "proposal_meta": proposal_meta if args.llm_propose else {},
-        "issue_text_len_raw": len(issue_text_raw),
-        "retriever_type": retriever_debug.get("retriever_type", "keyword"),
-        "candidate_k": retriever_debug.get("candidate_k"),
-        "vector_model_name": (retriever_debug.get("vector_index_info") or {}).get("model_name") or "",
-    }
-    if args.mode == "github":
+
+    if getattr(args, "_github_author_unresolved", False):
         from . import github_bot
-        from . import audit
-        # Audit: consistent string fields; executed_actions always a list
-        audit_record["approval_status"] = "n/a"
-        audit_record["approval_actor_login"] = ""
-        audit_record["approval_actor_role"] = ""
-        audit_record["executed_actions"] = []
-        audit_record["execution_result"] = "n/a"
-        try:
-            stage = getattr(args, "github_stage", "propose") or "propose"
-            if stage == "propose":
-                # Only post Proposed Plan and exit (no approval checks)
-                plan_body = (
-                    "## Proposed Plan (PENDING APPROVAL)\n\n"
-                    + (proposed_actions_struct.get("comment_summary","").strip() + "\n\n" if proposed_actions_struct.get("comment_summary") else "")
-                    + answer_data["answer"]
-                    + "\n\n### Intermediate (evidence summary)\n```json\n"
-                    + json.dumps(answer_data.get("intermediate", {}), indent=2)
-                    + "\n```\n"
-                    + "\n### Intermediate meta\n```json\n"
-                    + json.dumps(answer_data.get("intermediate_meta", {}), indent=2)
-                    + "\n```\n"
-                    + "\n### Proposed actions (struct)\n```json\n"
-                    + json.dumps(proposed_actions_struct, indent=2)
-                    + "\n```"
-                    + "\n\n### Proposal meta\n```json\n"
-                    + json.dumps(proposal_meta if args.llm_propose else {}, indent=2)
-                    + "\n```\n"
-                    + "\n### Proposal (LLM)\n```json\n"
-                    + json.dumps(proposal if args.llm_propose else {}, indent=2)
-                    + "\n```\n"
-                )
-
-                github_bot.post_comment(args.repo, args.issue_number, plan_body)
-
-                labels = list(proposed_actions_struct.get("labels_to_add") or [])
-                if labels:
-                    github_bot.add_labels(args.repo, args.issue_number, labels, remove_prefixes=["status:"])
-
-                audit_record["approval_status"] = "n/a"
-                audit_record["execution_result"] = "propose_only"
-                audit_record["executed_actions"] = []
-            else:
-                # execute: do NOT post plan; only consider APPROVE comments after latest Proposed Plan
-                comments = github_bot.list_comments(args.repo, args.issue_number)
-                plan_comment, parsed_struct, approve_comment = _find_latest_proposed_plan_and_approve(comments)
-                # Enterprise-safe: only execute actions based on the last Proposed Plan.
-                # If plan exists but JSON struct is missing/unparseable, do not execute.
-                if plan_comment is not None and not parsed_struct:
-                    audit_record["approval_status"] = "rejected"
-                    audit_record["execution_result"] = "invalid_plan_format"
-                    audit_record["executed_actions"] = []
-                    latency_ms = round((_time.perf_counter() - _start_audit) * 1000)
-                    audit_record["latency_ms"] = latency_ms
-                    audit.append_jsonl(audit_record, path=audit_path, repo_root=repo_root)
-                    print(json.dumps(output, indent=2))
-                    return
-
-                struct_for_execute = parsed_struct if parsed_struct else proposed_actions_struct
-                approval_status = "pending"
-                approval_actor_login = ""
-                approval_actor_role = ""
-                executed_actions = []
-                execution_result = "skipped"
-                if approve_comment:
-                    approval_actor_login = (approve_comment.get("login") or "")
-                    login_lower = approval_actor_login.lower()
-                    approver_info = by_github_username.get(login_lower)
-                    if approver_info:
-                        approval_actor_role = approver_info.get("role") or ""
-                        if approval_actor_role == "Employee":
-                            approval_status = "rejected"
-                            execution_result = "rejected_employee_approval"
-                        elif struct_for_execute.get("needs_approval"):
-                            if struct_for_execute.get("risk_level") == "L2":
-                                if approval_actor_role != "IT Admin":
-                                    approval_status = "rejected"
-                                    execution_result = "rejected_l2_requires_it_admin"
-                                else:
-                                    approval_status = "approved"
-                                    current_labels = github_bot.get_issue_labels(args.repo, args.issue_number)
-                                    if "status:approved" in (current_labels or []):
-                                        execution_result = "already_approved_skip"
-                                        executed_actions = []
-                                    else:
-                                        base_labels = list(struct_for_execute.get("labels_to_add") or [])
-
-                                        # Keep only non-status labels (e.g., cat:* and prio:*)
-                                        labels = [lb for lb in base_labels if not str(lb).startswith("status:")]
-
-                                        # Set final status
-                                        labels.append("status:approved")
-
-                                        if labels:
-                                            github_bot.add_labels(
-                                                args.repo,
-                                                args.issue_number,
-                                                labels,
-                                                remove_prefixes=["status:"],  # remove any existing status:* before adding the new one
-                                            )
-                                            executed_actions.append("add_labels")
-
-                                        if struct_for_execute.get("assignees"):
-                                            github_bot.add_assignees(args.repo, args.issue_number, struct_for_execute["assignees"])
-                                            executed_actions.append("add_assignees")
-                                        github_bot.post_comment(args.repo, args.issue_number, "## Executed actions\n\n" + json.dumps({"executed": executed_actions}, indent=2))
-                                        execution_result = "success"
-                            else:
-                                if approval_actor_role not in ("Engineer", "IT Admin"):
-                                    approval_status = "rejected"
-                                    execution_result = "rejected_l1_requires_engineer_or_admin"
-                                else:
-                                    approval_status = "approved"
-                                    current_labels = github_bot.get_issue_labels(args.repo, args.issue_number)
-                                    if "status:approved" in (current_labels or []):
-                                        execution_result = "already_approved_skip"
-                                        executed_actions = []
-                                    else:
-                                        base_labels = list(struct_for_execute.get("labels_to_add") or [])
-
-                                        # Keep only non-status labels (e.g., cat:* and prio:*)
-                                        labels = [lb for lb in base_labels if not str(lb).startswith("status:")]
-
-                                        # Set final status
-                                        labels.append("status:approved")
-
-                                        if labels:
-                                            github_bot.add_labels(
-                                                args.repo,
-                                                args.issue_number,
-                                                labels,
-                                                remove_prefixes=["status:"],  # remove any existing status:* before adding the new one
-                                            )
-                                            executed_actions.append("add_labels")
-
-                                        if struct_for_execute.get("assignees"):
-                                            github_bot.add_assignees(args.repo, args.issue_number, struct_for_execute["assignees"])
-                                            executed_actions.append("add_assignees")
-                                        github_bot.post_comment(args.repo, args.issue_number, "## Executed actions\n\n" + json.dumps({"executed": executed_actions}, indent=2))
-                                        execution_result = "success"
-                        else:
-                            approval_status = "approved"
-                            execution_result = "skipped"
-                    else:
-                        approval_status = "rejected"
-                        execution_result = "approver_not_in_directory"
-                else:
-                    if plan_comment is None:
-                        execution_result = "no_proposed_plan"
-                audit_record["approval_status"] = approval_status
-                audit_record["approval_actor_login"] = approval_actor_login or ""
-                audit_record["approval_actor_role"] = approval_actor_role or ""
-                audit_record["executed_actions"] = executed_actions if isinstance(executed_actions, list) else []
-                audit_record["execution_result"] = execution_result
-        except Exception as e:
-            audit_record["execution_result"] = "error"
-            audit_record["error"] = str(e)
-            audit_record["executed_actions"] = []
-            output["debug"]["github_error"] = str(e)
-        latency_ms = round((_time.perf_counter() - _start_audit) * 1000)
-        audit_record["latency_ms"] = latency_ms
-        audit.append_jsonl(audit_record, path=audit_path, repo_root=repo_root)
+        github_bot.post_comment(
+            args.repo,
+            args.issue_number,
+            "We could not match the issue author to a user in our directory. Please escalate to IT or an administrator to get access.",
+        )
+        audit_record = {
+            "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            "repo": str(args.repo),
+            "issue_number": int(args.issue_number),
+            "requester_user_id": "",
+            "requester_role": "Unknown",
+            "allowed_tiers": ["public"],
+            "triage": {},
+            "execution_result": "author_unresolved",
+        }
+        # Audit: written exactly once per run. This path finalizes here; normal path finalizes in _write_audit_and_maybe_github() via _finalize_audit(). Do not add a second finalize.
+        _finalize_audit(audit_record, audit_path, repo_root, _start_audit)
+        output = {
+            "answer": "Author unresolved; escalation comment posted.",
+            "citations": [],
+            "debug": {"execution_result": "author_unresolved"},
+        }
     else:
-        latency_ms = round((_time.perf_counter() - _start_audit) * 1000)
-        audit_record["latency_ms"] = latency_ms
-        audit_record["approval_status"] = "n/a"
-        audit_record["execution_result"] = "n/a"
-        from . import audit as _audit
-        _audit.append_jsonl(audit_record, path=audit_path, repo_root=repo_root)
+        all_sections = _load_sections(repo_root, allowed_tiers)
+        retrieved, retriever_debug = _run_retrieval(args, issue_text, all_sections, repo_root)
+
+        answer_data, triage_data, proposed_actions_struct, proposal, proposal_meta = _build_answer_and_actions(
+            args, issue_text, retrieved, issue_text_source
+        )
+
+        output = _build_output_json(
+            args, answer_data, triage_data, proposed_actions_struct, proposal, proposal_meta,
+            role, allowed_tiers, issue_text_source, issue_text_raw, issue_text, retrieved, retriever_debug,
+        )
+
+        _write_audit_and_maybe_github(
+            args, output, answer_data, triage_data, proposed_actions_struct, proposal, proposal_meta,
+            retrieved, retriever_debug, by_github_username, repo_root, audit_path, _start_audit,
+            issue_text_source, issue_text_raw, issue_text,
+        )
 
     print(json.dumps(output, indent=2))
+    if getattr(args, "_github_author_unresolved", False):
+        sys.exit(0)
 
 
 if __name__ == "__main__":

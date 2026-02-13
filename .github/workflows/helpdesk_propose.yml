@@ -1,0 +1,28 @@
+# Runs on issue opened/edited/reopened: post Proposed Plan (TRIAGED or PENDING APPROVAL) with citations and <details>.
+# Uses hybrid retrieval. OPENAI_API_KEY optional (run.py falls back to deterministic when missing).
+name: Helpdesk Propose
+on:
+  issues:
+    types: [opened, edited, reopened]
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e ".[vector]"
+      - name: Run propose
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: |
+          python -m src.run --mode github --github_stage propose \
+            --repo "${{ github.repository }}" \
+            --issue_number "${{ github.event.issue.number }}" \
+            --retriever hybrid --candidate_k 30 --top_k 3 \
+            --llm_intermediate --llm_propose

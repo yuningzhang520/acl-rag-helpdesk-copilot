@@ -67,9 +67,12 @@ def get_issue(repo: str, issue_number: int) -> Dict[str, Any]:
 
 def list_comments(repo: str, issue_number: int) -> List[Dict[str, Any]]:
     """
-    List comments on an issue. Returns list of {login, body, created_at}.
+    List comments on an issue, sorted ascending by creation time.
+    Returns list of {id, login, user: {login}, body, created_at}; login and body are always str.
+    run.py relies on this order and shape for plan/approve detection.
+    MVP: per_page=100; issues with more than 100 comments are not paginated (explicit limitation).
     """
-    url = f"{_base_url(repo)}/issues/{issue_number}/comments"
+    url = f"{_base_url(repo)}/issues/{issue_number}/comments?sort=created&direction=asc&per_page=100"
     try:
         rows = _req_list("GET", url)
     except urllib.error.HTTPError as e:
@@ -78,10 +81,13 @@ def list_comments(repo: str, issue_number: int) -> List[Dict[str, Any]]:
     out = []
     for r in rows:
         user = r.get("user") or {}
+        login = str(user.get("login") or r.get("login") or "")
         out.append({
-            "login": user.get("login", ""),
-            "body": r.get("body", ""),
-            "created_at": r.get("created_at", ""),
+            "id": r.get("id"),
+            "login": login,
+            "user": {"login": login},
+            "body": str(r.get("body") or ""),
+            "created_at": str(r.get("created_at") or ""),
         })
     return out
 
