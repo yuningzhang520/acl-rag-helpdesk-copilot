@@ -115,6 +115,8 @@ def main() -> None:
         expected_doc_list = gs.get("must_cite") or []
         must_not_cite = gs.get("must_not_cite") or []
         for retriever in retrievers:
+            has_expected_docs = len(expected_doc_list) > 0
+            skipped_in_avg = not has_expected_docs
             try:
                 out = run_pipeline(user_id, issue, retriever=retriever, top_k=3)
             except Exception as e:
@@ -125,6 +127,8 @@ def main() -> None:
                     "mrr_at_3": 0.0,
                     "acl_pass": False,
                     "top_docs": "",
+                    "has_expected_docs": has_expected_docs,
+                    "skipped_in_avg": skipped_in_avg,
                     "error": str(e),
                 })
                 continue
@@ -139,9 +143,11 @@ def main() -> None:
                 "mrr_at_3": mrr,
                 "acl_pass": acl_ok,
                 "top_docs": top_docs_str(citations, 3),
+                "has_expected_docs": has_expected_docs,
+                "skipped_in_avg": skipped_in_avg,
             })
 
-    fieldnames = ["case_id", "retriever", "recall_at_3", "mrr_at_3", "acl_pass", "top_docs"]
+    fieldnames = ["case_id", "retriever", "recall_at_3", "mrr_at_3", "acl_pass", "top_docs", "has_expected_docs", "skipped_in_avg"]
     if any("error" in r for r in rows):
         fieldnames.append("error")
     with open(OUT_CSV, "w", encoding="utf-8", newline="") as f:
@@ -150,25 +156,33 @@ def main() -> None:
         writer.writerows(rows)
 
     n_cases = len(cases)
+    n_with_expected_docs = sum(1 for gs in cases if (gs.get("must_cite") or []))
     report_lines = [
         "# Retrieval Eval Report",
         "",
-        f"Cases: {n_cases} | Retrievers: keyword, vector, hybrid",
+        f"N_total cases: {n_cases} | N_with_expected_docs: {n_with_expected_docs} | Retrievers: keyword, vector, hybrid",
         "",
         "## Averages (per retriever)",
         "",
-        "| Retriever | Recall@3 | MRR@3 | ACL pass % |",
-        "|-----------|----------|-------|------------|",
+        "Recall@3 and MRR@3 are computed only over rows where has_expected_docs=true and no error. ACL pass % is over all non-error rows.",
+        "",
+        "| Retriever | N_used_for_recall_mrr | Recall@3 | MRR@3 | ACL pass % |",
+        "|-----------|------------------------|----------|-------|------------|",
     ]
     for ret in retrievers:
-        sub = [r for r in rows if r.get("retriever") == ret and "error" not in r]
-        if not sub:
-            report_lines.append(f"| {ret} | - | - | - |")
+        non_error = [r for r in rows if r.get("retriever") == ret and "error" not in r]
+        used_for_recall_mrr = [r for r in non_error if r.get("has_expected_docs")]
+        n_used = len(used_for_recall_mrr)
+        if not non_error:
+            report_lines.append(f"| {ret} | 0 | - | - | - |")
             continue
-        rec_avg = sum(r["recall_at_3"] for r in sub) / len(sub)
-        mrr_avg = sum(r["mrr_at_3"] for r in sub) / len(sub)
-        acl_pct = 100.0 * sum(1 for r in sub if r["acl_pass"]) / len(sub)
-        report_lines.append(f"| {ret} | {rec_avg:.3f} | {mrr_avg:.3f} | {acl_pct:.1f}% |")
+        acl_pct = 100.0 * sum(1 for r in non_error if r["acl_pass"]) / len(non_error)
+        if n_used == 0:
+            report_lines.append(f"| {ret} | 0 | - | - | {acl_pct:.1f}% |")
+            continue
+        rec_avg = sum(r["recall_at_3"] for r in used_for_recall_mrr) / n_used
+        mrr_avg = sum(r["mrr_at_3"] for r in used_for_recall_mrr) / n_used
+        report_lines.append(f"| {ret} | {n_used} | {rec_avg:.3f} | {mrr_avg:.3f} | {acl_pct:.1f}% |")
     report_lines.extend(["", "## Output", "", f"- `{OUT_CSV}`", ""])
     with open(OUT_MD, "w", encoding="utf-8") as f:
         f.write("\n".join(report_lines))
@@ -176,12 +190,16 @@ def main() -> None:
     print(f"Wrote {OUT_CSV}")
     print(f"Wrote {OUT_MD}")
     for ret in retrievers:
-        sub = [r for r in rows if r.get("retriever") == ret and "error" not in r]
-        if sub:
-            rec_avg = sum(r["recall_at_3"] for r in sub) / len(sub)
-            mrr_avg = sum(r["mrr_at_3"] for r in sub) / len(sub)
-            acl_pct = 100.0 * sum(1 for r in sub if r["acl_pass"]) / len(sub)
-            print(f"  {ret}: Recall@3={rec_avg:.3f} MRR@3={mrr_avg:.3f} ACL_pass={acl_pct:.1f}%")
+        non_error = [r for r in rows if r.get("retriever") == ret and "error" not in r]
+        used = [r for r in non_error if r.get("has_expected_docs")]
+        if non_error:
+            acl_pct = 100.0 * sum(1 for r in non_error if r["acl_pass"]) / len(non_error)
+            if used:
+                rec_avg = sum(r["recall_at_3"] for r in used) / len(used)
+                mrr_avg = sum(r["mrr_at_3"] for r in used) / len(used)
+                print(f"  {ret}: N_used={len(used)} Recall@3={rec_avg:.3f} MRR@3={mrr_avg:.3f} ACL_pass={acl_pct:.1f}%")
+            else:
+                print(f"  {ret}: N_used=0 Recall@3=- MRR@3=- ACL_pass={acl_pct:.1f}%")
 
 
 if __name__ == "__main__":

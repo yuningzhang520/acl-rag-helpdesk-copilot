@@ -9,6 +9,7 @@ Dev notes:
   so different ACL scopes (e.g. Employee vs IT Admin) do not share the same index and risk leaking restricted content.
 - Cache is also guarded by a content fingerprint; editing docs invalidates cache without --rebuild_index.
 """
+# given an issue_text + a bunch of ACL-filtered runbook sections, return the top_k most relevant sections, and return the "why we selected them" (score/debug) together.
 
 import hashlib
 import json
@@ -197,7 +198,7 @@ def _section_troubleshoot_bias(section: Dict) -> float:
         out += _BIAS_NEGATIVE
     return out
 
-
+# in the top_k retrieved, then rerank top candidate use keyword score. used in the hybrid retriever vector rank retrieved + keyword rerank
 def keyword_rerank_candidates(issue_text: str, candidates: List[Dict]) -> List[Dict]:
     """Add keyword_score to each candidate using text_utils (vector_score/score already set)."""
     from . import text_utils
@@ -237,6 +238,7 @@ def retrieve(
         "troubleshoot_intent_detected": troubleshoot_intent if troubleshoot_bias else None,
     }
 
+# use tk overlap score to retrieve top_k sections
     if retriever_type == "keyword":
         from . import text_utils
         issue_tokens = text_utils.tokenize(issue_text)
@@ -270,6 +272,7 @@ def retrieve(
     if not candidates:
         return [], debug_info
 
+    # vector: use vector score to retrieve top_k sections
     if retriever_type == "vector":
         top = candidates[:top_k]
         return [

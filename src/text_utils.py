@@ -19,7 +19,7 @@ def section_to_text_for_scoring(section: Dict) -> str:
     content = section.get("content", "")
     return f"{heading} {filename} {content}".strip()
 
-
+# score+=w×TFsection​(t), score+=HEAD_WEIGHT×w (if t∈heading/filename)
 def score_section(section: Dict, issue_tokens: List[str]) -> float:
     """Score section vs issue using TF overlap on heading+filename+content + small heading bonus."""
     issue_counter = Counter(issue_tokens)

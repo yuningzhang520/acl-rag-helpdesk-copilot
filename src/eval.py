@@ -129,7 +129,7 @@ def main() -> None:
                 gate_ok = (
                     proposed_struct.get("risk_level") == "L2"
                     and proposed_struct.get("needs_approval") is True
-                    and proposed_struct.get("approval_role") == "IT Admin"
+                    and (proposed_struct.get("approval_role_required") or proposed_struct.get("approval_role")) == "IT Admin"
                 )
             elif expected_approval == "n/a":
                 gate_ok = (proposed_struct.get("needs_approval") is False)
