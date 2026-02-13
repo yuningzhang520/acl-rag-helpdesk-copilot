@@ -19,7 +19,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Restore venv cache
         id: venv-cache
@@ -43,6 +42,17 @@ jobs:
             hf-${{ runner.os }}-allminilm-v1-
             hf-${{ runner.os }}-
 
+      - name: Restore pip cache (only when venv cache missed)
+        id: pip-cache
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py311-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ runner.arch }}-py311-
+            pip-${{ runner.os }}-
+
       - name: Install dependencies (CPU torch + project)
         if: steps.venv-cache.outputs.cache-hit != 'true'
         env:
@@ -65,6 +75,8 @@ jobs:
           HF_HOME: ${{ github.workspace }}/.cache/huggingface
           TRANSFORMERS_CACHE: ${{ github.workspace }}/.cache/huggingface
           TORCH_HOME: ${{ github.workspace }}/.cache/torch
+          # Optional: when hf-cache hit, reduce log noise: TRANSFORMERS_OFFLINE=1
+          # Optional: HF progress bars off: HF_HUB_DISABLE_PROGRESS_BARS=1
         run: |
           source .venv/bin/activate
           python -m src.run --mode github --github_stage propose \
@@ -79,6 +91,13 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ runner.arch }}-py311-${{ hashFiles('**/pyproject.toml') }}
+
+      - name: Save pip cache (only when venv and pip restore missed)
+        if: steps.venv-cache.outputs.cache-hit != 'true' && steps.pip-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-py311-${{ hashFiles('**/pyproject.toml') }}
 
       - name: Save HF/torch cache (only on miss)
         if: steps.hf-cache.outputs.cache-hit != 'true'
