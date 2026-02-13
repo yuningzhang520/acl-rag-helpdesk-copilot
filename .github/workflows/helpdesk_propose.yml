@@ -21,9 +21,9 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Cache venv
+      - name: Restore venv cache
         id: venv-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ runner.arch }}-py311-${{ hashFiles('**/pyproject.toml') }}
@@ -31,11 +31,10 @@ jobs:
             venv-${{ runner.os }}-${{ runner.arch }}-py311-
             venv-${{ runner.os }}-
 
-      - name: Cache HF/torch models
+      - name: Restore HF/torch cache
         id: hf-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          enableCrossOsArchive: true
           path: |
             .cache/huggingface
             .cache/torch
@@ -73,3 +72,19 @@ jobs:
             --issue_number "${{ github.event.issue.number }}" \
             --retriever hybrid --candidate_k 30 --top_k 3 \
             --llm_intermediate --llm_propose
+
+      - name: Save venv cache (only on miss)
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ runner.arch }}-py311-${{ hashFiles('**/pyproject.toml') }}
+
+      - name: Save HF/torch cache (only on miss)
+        if: steps.hf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cache/huggingface
+            .cache/torch
+          key: hf-${{ runner.os }}-allminilm-v1-${{ hashFiles('**/pyproject.toml') }}
