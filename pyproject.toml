@@ -12,6 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 vector = ["sentence-transformers", "scikit-learn", "numpy"]
+execute = []
 
 [tool.setuptools.packages.find]
 where = ["."]

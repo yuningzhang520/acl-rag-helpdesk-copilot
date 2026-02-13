@@ -1466,6 +1466,136 @@ def _apply_approved_actions(
     return executed
 
 
+def _run_execute_stage(
+    args: Any,
+    repo_root: Path,
+    audit_path: Path,
+    start_time_perf: float,
+    by_github_username: Dict,
+) -> Dict[str, Any]:
+    """
+    Lightweight execute-only path: find latest Proposed Plan + APPROVE comment,
+    validate approver role, apply allowlisted actions or post rejection. No retrieval, no docs.
+    Writes audit once via _finalize_audit. Returns small output JSON for stdout.
+    """
+    import time as _time
+    from . import github_bot
+
+    audit_record = {
+        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "repo": str(args.repo) if (args.mode == "github" and args.repo) else "",
+        "issue_number": int(args.issue_number) if (args.mode == "github" and args.issue_number is not None) else 0,
+        "requester_user_id": "",
+        "requester_role": "",
+        "allowed_tiers": ["public"],
+        "approval_status": "n/a",
+        "approval_actor_login": "",
+        "approval_actor_role": "",
+        "executed_actions": [],
+        "execution_result": "n/a",
+        "latency_ms": 0,
+        "estimated_cost": 0,
+    }
+
+    def _out(approval_status: str, approval_actor_login: str, approval_actor_role: str, executed_actions: List[str], execution_result: str) -> Dict[str, Any]:
+        return {
+            "execution": {
+                "approval_status": approval_status,
+                "approval_actor_login": approval_actor_login,
+                "approval_actor_role": approval_actor_role,
+                "executed_actions": executed_actions,
+                "execution_result": execution_result,
+            }
+        }
+
+    try:
+        current_labels = github_bot.get_issue_labels(args.repo, args.issue_number) or []
+        if "status:executed" in current_labels:
+            audit_record["execution_result"] = "already_executed_noop"
+            _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+            return _out("n/a", "", "", [], "already_executed_noop")
+
+        comments = github_bot.list_comments(args.repo, args.issue_number)
+        plan_comment, parsed_struct, approve_comment = _find_latest_proposed_plan_and_approve(comments)
+
+        if plan_comment is None:
+            audit_record["execution_result"] = "no_proposed_plan"
+            _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, "no_proposed_plan")
+            _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+            return _out("n/a", "", "", [], "no_proposed_plan")
+
+        if parsed_struct is None:
+            audit_record["approval_status"] = "rejected"
+            audit_record["execution_result"] = "invalid_plan_format"
+            _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, "invalid_plan_format")
+            _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+            return _out("rejected", "", "", [], "invalid_plan_format")
+
+        struct_for_execute = parsed_struct
+        if struct_for_execute.get("needs_approval") is False:
+            audit_record["approval_status"] = "n/a"
+            audit_record["execution_result"] = "l1_noop"
+            audit_record["executed_actions"] = []
+            _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+            return _out("n/a", "", "", [], "l1_noop")
+
+        approval_status = "pending"
+        approval_actor_login = ""
+        approval_actor_role = ""
+        executed_actions: List[str] = []
+        execution_result = "no_approval_found"
+
+        if approve_comment:
+            approval_actor_login = (
+                approve_comment.get("login")
+                or (approve_comment.get("user") or {}).get("login")
+                or ""
+            )
+            login_lower = approval_actor_login.lower()
+            approver_info = by_github_username.get(login_lower)
+            if approver_info:
+                approval_actor_role = approver_info.get("role") or ""
+                if approval_actor_role == "Employee":
+                    approval_status = "rejected"
+                    execution_result = "rejected_employee_approval"
+                elif struct_for_execute.get("needs_approval"):
+                    if struct_for_execute.get("risk_level") == "L2":
+                        if approval_actor_role != "IT Admin":
+                            approval_status = "rejected"
+                            execution_result = "rejected_l2_requires_it_admin"
+                        else:
+                            approval_status = "approved"
+                            executed_actions = _apply_approved_actions(args.repo, args.issue_number, struct_for_execute, github_bot)
+                            execution_result = "already_approved_skip" if not executed_actions else "success"
+                    else:
+                        if approval_actor_role not in ("Engineer", "IT Admin"):
+                            approval_status = "rejected"
+                            execution_result = "rejected_l1_requires_engineer_or_admin"
+                        else:
+                            approval_status = "approved"
+                            executed_actions = _apply_approved_actions(args.repo, args.issue_number, struct_for_execute, github_bot)
+                            execution_result = "already_approved_skip" if not executed_actions else "success"
+            else:
+                approval_status = "rejected"
+                execution_result = "approver_not_in_directory"
+
+        _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, execution_result)
+        audit_record["approval_status"] = approval_status
+        audit_record["approval_actor_login"] = approval_actor_login or ""
+        audit_record["approval_actor_role"] = approval_actor_role
+        audit_record["executed_actions"] = executed_actions
+        audit_record["execution_result"] = execution_result
+        _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+        return _out(approval_status, approval_actor_login or "", approval_actor_role, executed_actions, execution_result)
+
+    except Exception as e:
+        audit_record["execution_result"] = "error"
+        audit_record["error"] = str(e)
+        audit_record["executed_actions"] = []
+        _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
+        return _out("rejected", "", "", [], "error")
+
+
 def _write_audit_and_maybe_github(
     args: Any,
     output: Dict,
@@ -1485,7 +1615,6 @@ def _write_audit_and_maybe_github(
     issue_text_normalized: str,
 ) -> None:
     import time as _time
-    from . import audit
     debug_retrieved = output["debug"]["retrieved"]
     audit_record = {
         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
@@ -1516,6 +1645,10 @@ def _write_audit_and_maybe_github(
         "vector_model_name": (retriever_debug.get("vector_index_info") or {}).get("model_name") or "",
     }
     if args.mode == "github":
+        if getattr(args, "github_stage", "propose") == "execute":
+            raise RuntimeError(
+                "Execute stage is handled by _run_execute_stage; _write_audit_and_maybe_github should not be used for execute."
+            )
         from . import github_bot
         try:
             if getattr(args, "github_stage", "propose") == "propose":
@@ -1559,76 +1692,6 @@ def _write_audit_and_maybe_github(
                     audit_record["execution_result"] = "propose_and_execute"
                 else:
                     audit_record["execution_result"] = "propose_only"
-            else:
-                current_labels = github_bot.get_issue_labels(args.repo, args.issue_number) or []
-                if "status:executed" in current_labels:
-                    audit_record["execution_result"] = "already_executed_noop"
-                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
-                    return
-                comments = github_bot.list_comments(args.repo, args.issue_number)
-                plan_comment, parsed_struct, approve_comment = _find_latest_proposed_plan_and_approve(comments)
-                if plan_comment is None:
-                    audit_record["execution_result"] = "no_proposed_plan"
-                    _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, "no_proposed_plan")
-                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
-                    return
-                if parsed_struct is None:
-                    audit_record["approval_status"] = "rejected"
-                    audit_record["execution_result"] = "invalid_plan_format"
-                    _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, "invalid_plan_format")
-                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
-                    return
-                struct_for_execute = parsed_struct
-                if struct_for_execute.get("needs_approval") is False:
-                    audit_record["approval_status"] = "n/a"
-                    audit_record["execution_result"] = "l1_noop"
-                    audit_record["executed_actions"] = []
-                    _finalize_audit(audit_record, audit_path, repo_root, start_time_perf)
-                    return
-                approval_status = "pending"
-                approval_actor_login = ""
-                approval_actor_role = ""
-                executed_actions: List[str] = []
-                execution_result = "no_approval_found"  # plan exists, struct OK; no APPROVE comment after it
-                if approve_comment:
-                    approval_actor_login = (
-                        approve_comment.get("login")
-                        or (approve_comment.get("user") or {}).get("login")
-                        or ""
-                    )
-                    login_lower = approval_actor_login.lower()
-                    approver_info = by_github_username.get(login_lower)
-                    if approver_info:
-                        approval_actor_role = approver_info.get("role") or ""
-                        if approval_actor_role == "Employee":
-                            approval_status = "rejected"
-                            execution_result = "rejected_employee_approval"
-                        elif struct_for_execute.get("needs_approval"):
-                            if struct_for_execute.get("risk_level") == "L2":
-                                if approval_actor_role != "IT Admin":
-                                    approval_status = "rejected"
-                                    execution_result = "rejected_l2_requires_it_admin"
-                                else:
-                                    approval_status = "approved"
-                                    executed_actions = _apply_approved_actions(args.repo, args.issue_number, struct_for_execute, github_bot)
-                                    execution_result = "already_approved_skip" if not executed_actions else "success"
-                            else:
-                                if approval_actor_role not in ("Engineer", "IT Admin"):
-                                    approval_status = "rejected"
-                                    execution_result = "rejected_l1_requires_engineer_or_admin"
-                                else:
-                                    approval_status = "approved"
-                                    executed_actions = _apply_approved_actions(args.repo, args.issue_number, struct_for_execute, github_bot)
-                                    execution_result = "already_approved_skip" if not executed_actions else "success"
-                    else:
-                        approval_status = "rejected"
-                        execution_result = "approver_not_in_directory"
-                _maybe_post_rejection_comment(github_bot, args.repo, args.issue_number, execution_result)
-                audit_record["approval_status"] = approval_status
-                audit_record["approval_actor_login"] = approval_actor_login or ""
-                audit_record["approval_actor_role"] = approval_actor_role or ""
-                audit_record["executed_actions"] = executed_actions
-                audit_record["execution_result"] = execution_result
         except Exception as e:
             audit_record["execution_result"] = "error"
             audit_record["error"] = str(e)
@@ -1659,13 +1722,19 @@ def main():
     _start_audit = _time.perf_counter()
 
     _require_github_args_or_exit(args)
-    issue_text_raw, issue_text_source, issue_author_login = _get_issue_text_or_exit(args)
-    issue_text = normalize_issue_text(issue_text_raw, issue_text_source)
 
     repo_root = Path(__file__).parent.parent
-    directory, by_github_username = _load_directory_or_exit(repo_root)
-    role, allowed_tiers = _resolve_user_or_exit(args, directory, by_github_username, issue_author_login)
     audit_path = repo_root / "workflows" / "audit_log.jsonl"
+    directory, by_github_username = _load_directory_or_exit(repo_root)
+
+    if args.mode == "github" and getattr(args, "github_stage", "propose") == "execute":
+        output = _run_execute_stage(args, repo_root, audit_path, _start_audit, by_github_username)
+        print(json.dumps(output, indent=2))
+        return
+
+    issue_text_raw, issue_text_source, issue_author_login = _get_issue_text_or_exit(args)
+    issue_text = normalize_issue_text(issue_text_raw, issue_text_source)
+    role, allowed_tiers = _resolve_user_or_exit(args, directory, by_github_username, issue_author_login)
 
     if getattr(args, "_github_author_unresolved", False):
         from . import github_bot
