@@ -16,30 +16,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # pip cache
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      # cache HF/torch model files (recommended: cache inside repo workspace)
-      - name: Cache HF models
+      - name: Cache venv
+        id: venv-cache
         uses: actions/cache@v4
         with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ runner.arch }}-py311-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            venv-${{ runner.os }}-${{ runner.arch }}-py311-
+            venv-${{ runner.os }}-
+
+      - name: Cache HF/torch models
+        id: hf-cache
+        uses: actions/cache@v4
+        with:
+          enableCrossOsArchive: true
           path: |
             .cache/huggingface
             .cache/torch
-          key: hf-${{ runner.os }}-${{ hashFiles('**/pyproject.toml') }}
-          restore-keys: hf-${{ runner.os }}-
+          key: hf-${{ runner.os }}-allminilm-v1-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            hf-${{ runner.os }}-allminilm-v1-
+            hf-${{ runner.os }}-
 
-      # avoid CUDA torch: install CPU-only torch first, then your deps
       - name: Install dependencies (CPU torch + project)
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         env:
-          # make HF cache go into repo workspace (matches cache path above)
           HF_HOME: ${{ github.workspace }}/.cache/huggingface
           TRANSFORMERS_CACHE: ${{ github.workspace }}/.cache/huggingface
           TORCH_HOME: ${{ github.workspace }}/.cache/torch
         run: |
+          python -m venv .venv
+          source .venv/bin/activate
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install -e ".[vector]"
@@ -50,12 +63,11 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
-          # keep caches consistent during runtime too
           HF_HOME: ${{ github.workspace }}/.cache/huggingface
           TRANSFORMERS_CACHE: ${{ github.workspace }}/.cache/huggingface
           TORCH_HOME: ${{ github.workspace }}/.cache/torch
         run: |
+          source .venv/bin/activate
           python -m src.run --mode github --github_stage propose \
             --repo "${{ github.repository }}" \
             --issue_number "${{ github.event.issue.number }}" \
