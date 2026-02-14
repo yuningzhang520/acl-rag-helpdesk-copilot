@@ -1446,25 +1446,59 @@ def _rejection_comment_message(execution_result: str) -> str:
 def _apply_approved_actions(
     repo: str, issue_number: int, struct_for_execute: Dict, github_bot_module: Any
 ) -> List[str]:
-    """Apply labels and assignees from approved struct; post Executed actions comment. Returns executed_actions list. Idempotent: skips if status:executed already set."""
+    """Apply labels and assignees from approved struct; post Executed comment.
+    Returns executed_actions list. Idempotent: skips if status:executed already set.
+    """
     current_labels = github_bot_module.get_issue_labels(repo, issue_number) or []
     if "status:executed" in current_labels:
         return []
-    base_labels = [lb for lb in (struct_for_execute.get("labels_to_add") or []) if not str(lb).startswith("status:")]
+
+    base_labels = [
+        lb for lb in (struct_for_execute.get("labels_to_add") or [])
+        if not str(lb).startswith("status:")
+    ]
     labels = base_labels + ["status:executed"]
+    assignees = list(struct_for_execute.get("assignees") or [])
+
     executed: List[str] = []
+    labels_added: List[str] = []
+    assignees_added: List[str] = []
+
     if labels:
         github_bot_module.add_labels(repo, issue_number, labels, remove_prefixes=["status:"])
         executed.append("add_labels")
-    if struct_for_execute.get("assignees"):
-        github_bot_module.add_assignees(repo, issue_number, struct_for_execute["assignees"])
-        executed.append("add_assignees")
-    github_bot_module.post_comment(
-        repo, issue_number,
-        "## Executed actions\n\n" + json.dumps({"executed": executed}, indent=2)
-    )
-    return executed
+        labels_added = list(labels)
 
+    if assignees:
+        github_bot_module.add_assignees(repo, issue_number, assignees)
+        executed.append("add_assignees")
+        assignees_added = list(assignees)
+
+    executed_display = ", ".join(f"`{x}`" for x in executed) if executed else "(none)"
+    labels_display = ", ".join(f"`{lb}`" for lb in labels_added) if labels_added else "(none)"
+    assignees_display = ", ".join(f"`{a}`" for a in assignees_added) if assignees_added else "(none)"
+
+    payload = {
+        "executed": executed,
+        "labels_added": labels_added,
+        "assignees_added": assignees_added,
+    }
+
+    body = (
+        "## Executed\n\n"
+        "✅ Applied approved actions:\n"
+        f"- Executed: {executed_display}\n"
+        f"- Labels added: {labels_display}\n"
+        f"- Assignees added: {assignees_display}\n\n"
+        "<details><summary>Machine-readable payload</summary>\n\n"
+        "```json\n"
+        + json.dumps(payload, indent=2)
+        + "\n```\n"
+        "</details>\n"
+    )
+
+    github_bot_module.post_comment(repo, issue_number, body)
+    return executed
 
 def _run_execute_stage(
     args: Any,
